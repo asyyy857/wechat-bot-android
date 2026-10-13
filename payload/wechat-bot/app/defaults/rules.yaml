@@ -1,0 +1,546 @@
+# ============================================================================
+#  关键词规则表
+#
+#  命中规则 → 直接从 replies 里随机抽一条发出去，**不调用模型**（0 Token）。
+#  一条消息同时命中多条规则时，取 priority 最大的那条。
+#
+#  字段说明：
+#    name            规则名，出现在日志里
+#    keywords        触发词
+#    mode            contains 包含 / exact 全等 / regex 正则
+#    replies         候选回复，随机抽一条
+#    priority        越大越优先（默认 0）
+#    max_len         仅当消息长度 <= 该值时才触发（防止长句里捎带一个"6"就回复）
+#    cooldown        同一条规则两次触发之间的最小间隔秒数（0 = 不限）
+#    mention_exempt  被 @ 时不走这条规则，交给模型好好答。
+#                    像"问号/6"这种泛化词一定要开，否则别人问
+#                    "@你 你觉得呢？" 会被"问号"规则抢走，只能回一个"？"。
+#    case_sensitive  ASCII 关键词是否区分大小写（默认 false）
+#    no_meow         true = 这条回复不自动追加「喵」（默认 false = 加）。
+#                    ⚠️ 2026-10-04 用户要求「所有自动回复一律带喵」，
+#                    当前**没有任何规则**再用这个字段（想单条放行才填）。
+#    action          reply 回文字（默认）/ image 发一张表情包
+#    image_tag       action=image 时从 表情包\<这个名字>\ 里随机挑图；
+#                    留空则从 表情包\ 根目录挑。详见 表情包\读我.txt
+# ============================================================================
+
+rules:
+
+  # ====================== 你指定的：看见就回 ======================
+
+  # ---- 2026-10-06 用户点名要的：有人拍我脑袋 → 挠回去（发图）----
+  #   拍一拍以前是系统提示（读屏直接丢掉），2026-10-06 起 wxreader 把它单独标成
+  #   kind="pat" 放行，所以现在能到这儿。关键词**必须带上自己的昵称**，否则群里
+  #   别人互相拍也会触发（"拍了拍"这三个字谁拍谁都一样）。
+  #   cooldown 60 秒：拍一拍拍起来是会连发的，别让它刷屏。
+  #   ⚠️ 2026-10-06 实测修正（两处，缺一不可）：
+  #   ① 关键词**必须写"拍我的各种写法"**：别人拍我，微信显示的是我的**昵称**
+  #      （`高启强”拍了拍“你`），自己拍自己显示"自己"。OCR 对这种小灰字常读残
+  #      （`华暮”拍了拍“你（艾`），所以把引号/空格的变体都列上。
+  #      别人互拍（`张三 拍了拍 李四`）不含"你/自己" → 不触发 ✓ 这是用户要的。
+  #   ② **绝不能设 `mention_exempt: true`**！消息里出现昵称时 `mentioned=True`，
+  #      而 bot.handle 会**跳过所有 mention_exempt 规则** —— 这条于是被跳过、
+  #      掉进"被 @"分支走模型，回出来的是文字（实测「拍了掉毛喵」），不是表情包。
+  - name: "被拍脑袋"
+    keywords: ["拍了拍{{me}}", "拍了拍 {{me}}", "拍了拍“{{me}}", "拍了拍”{{me}}",
+               '拍了拍"{{me}}', "拍了拍自己", "拍了拍 自己"]
+    mode: contains
+    action: image
+    image_tag: "挠头,敲你脑袋,打手手,掐脖子,咬"
+    priority: 70
+    cooldown: 30
+
+  # ---- 2026-10-08 用户要的：群里有人发「今日美图」→ 随机发一张美图 ----
+  #   图是**联网取的**（图源返回 webp，代码自动转 JPEG 再发，见 wxauto/meitu.py），
+  #   每次触发换一张；网络取不到就从 美图库\ 里兜底。
+  #   图源清单、开关、冷却都在 config.yaml 的 meitu: 段里配。
+  #   ⚠️ action: meitu 是 2026-10-08 新加的动作（原来只有 reply / image），
+  #      所以**改这条规则之后要 `bash bot.sh start` 重启**才生效（规则文本本身热重载）。
+  - name: "今日美图"
+    keywords: ["今日美图", "今日份美图", "来张美图", "来点美图", "美图来一张"]
+    mode: contains
+    action: meitu
+    mention_ok: true           # ★ 被 @ 时也照常触发发图（2026-10-12 用户要求）
+    priority: 60
+    cooldown: 20
+
+  # ---- 2026-10-08 用户要的：看见「看看腿」→ 随机发一张他自己攒的图 ----
+  #   图集在 config.yaml 的 meitu.local_sets（指向他手机相册里的「看看腿」），
+  #   **不联网**、只发那一个目录里的图。图集只有一张时也照发。
+  #   他 2026-10-08 的原话：「有人触发看看腿关键词就回复然后随机发图」。
+  #   ⚠️ action: meitu 的规则里，`replies` 是**配文候选**（跟着图说的那一句），
+  #   不是单独的文字回复：先发图、隔一个回复间隔再把配文发出去。留空 = 只发图。
+  - name: "看看腿"
+    keywords: ["看看腿"]
+    mode: contains
+    action: meitu
+    mention_ok: true           # ★ 被 @ 时也照常触发发图（2026-10-12 用户要求）
+    meitu_source: "看看腿"
+    replies: ["喏 看吧喵",
+              "就一张 别贪心喵",
+              "看完记得说谢谢喵",
+              "只许看 不许想歪喵"]
+    priority: 60
+    cooldown: 0
+
+  # ---- 2026-10-08 用户要的：看见「看看腹肌」→ 同样发他自己攒的图 ----
+  #   他的原话：「再加一个看看腹肌的关键词儿，同样也是我会创一个看看腹肌的
+  #   图库，到时候你就发出去」。
+  #   ⚠️ 图集目录当时**还不存在** —— 这正是 meitu.py 把通配展开放到"每次发图时"
+  #   的原因：他建好相册就自动生效，不用重启，也不会掉到网络图源去发网图。
+  - name: "看看腹肌"
+    keywords: ["看看腹肌"]
+    mode: contains
+    action: meitu
+    mention_ok: true           # ★ 被 @ 时也照常触发发图（2026-10-12 用户要求）
+    meitu_source: "看看腹肌"
+    replies: ["哇 练过啊喵",
+              "就这 本喵也有喵",
+              "摸一下 不许多摸喵",
+              "别秀了 本喵不羡慕喵"]
+    priority: 60
+    cooldown: 0
+
+  # ---- 2026-10-05 加的：看见「红包」就回「」----
+  - name: "红包"
+    keywords: ["红包"]
+    mode: contains
+    action: image
+    image_tag: "我倒要看看"
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-05 加的：看见「笑死」就回「绷不住了」----
+  - name: "笑死"
+    keywords: ["笑死"]
+    mode: contains
+    replies: ["绷不住了"]
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-05 加的：看见「瓦」就回「叫妈妈」----
+  - name: "瓦"
+    keywords: ["瓦"]
+    mode: contains
+    replies: ["叫妈妈"]
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-05 加的：看见「哭」就回「哭也不停喵」----
+  # 2026-10-07 用户纠错：原回复「哭也不听」是打错字，正确口径是「哭也不停喵」
+  - name: "哭"
+    keywords: ["哭"]
+    mode: contains
+    replies: ["哭也不停喵"]
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-03 用户点名要的三条（不调模型，直接回）----
+  # 注：都开了 mention_exempt —— 被 @ 时让位给模型，免得别人专门点你却被一句
+  #     "-648" 打发；想连被 @ 都固定回，把这行删掉即可。
+
+  # ---- 2026-10-04 用户点名要的：看见「骚」就回「哪里骚了喵」----
+  # ⚠️ 2026-10-04 用户要求：**所有自动回复一律带「喵」**，这里不再用 no_meow。
+  # priority 58 压过「看看腿」(50)：一句话里两个词都出现时，先接这句。
+  # 不开 mention_exempt —— 被 @ 且带「骚」时也固定回这句。
+  #
+  # ★ 2026-10-07 用户：「他们说骚说的太频繁了，想一想还能回复什么」——
+  #   原来只有两句，群里一晚上能听八遍同样的。扩到 11 句，随机抽，
+  #   分几个味道：装傻 / 甩锅 / 认领 / 欠打 / 老油条 / 应景吐槽。
+  #   ⚠️ 这里的文本**一律不带「喵」**，发送层会统一补（带喵的只有那句特例）。
+  - name: 骚
+    keywords: ["骚"]
+    mode: contains
+    replies:
+      # ★ 2026-10-07 用户：「其他的我没说加的就不要了，我没看上」——
+      #   我自作主张加的 16 条已全部删掉，并逐条记进**拒稿记录**
+      #   （rejects.jsonl，见 wxauto/drafts.py），模型生成时也会避开这些说法。
+      # 只留四条，全是**用户点名要过**的：
+      - 哪里骚了                                   # 2026-10-04 用户点名（原始目的）
+      - 再骚本喵就挠你                             # 2026-10-07 用户点名
+      - 行了行了 都骚                              # 2026-10-07 用户点名
+      - 今天的骚度已超标，本喵要报警了喵            # 2026-10-06 用户点名
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-07 用户点名要的：看见「骚兰」就回「骚兰喵」----
+  # ⚠️ priority 必须 **大于「骚」的 58** —— "骚兰"里含"骚"，不压过就会被
+  #    「哪里骚了」抢走（一条消息同时命中多条时取 priority 最大的那条）。
+  #    回复写「骚兰」，发送层会自动补成「骚兰喵」（本项目惯例：replies 不带喵）。
+  - name: 骚兰
+    keywords: ["骚兰"]
+    mode: contains
+    replies: ["骚兰"]
+    priority: 59
+    cooldown: 30
+
+  # ---- 2026-10-07 用户点名要的：看见「魔了」就回「神了喵」----
+  # 用户原话：「关键词，魔了→神了喵」（魔了 ↔ 神了，对着接）。
+  # 回复写「神了」，发送层会自动补成「神了喵」（本项目惯例：replies 不带喵）。
+  - name: 魔了
+    keywords: ["魔了"]
+    mode: contains
+    replies: ["神了"]
+    cooldown: 30
+    # ⚠️ 2026-10-07：对齐反向那条「神了」—— 同是口头禅泛化词，被 @ 时**不抢词**，
+    #    交给模型好好答（否则「@你 你觉得呢」里带个"魔了"就被一句"神了"打发）。
+    mention_exempt: true
+
+  # ---- 2026-10-04 用户点名要的：看见「撸」就回「不要撸喵」----
+  # 同「骚」：priority 58 压过「看看腿」这类泛化词。
+  - name: 撸
+    keywords: ["撸"]
+    mode: contains
+    replies: ["不要撸"]
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-06 用户点名要的三条（外加上面「骚」里新加的那句）----
+  # 玩法跟「骚」「撸」一致：priority 58 压过泛化词、**不开 mention_exempt**
+  # （被 @ 时也固定回这句，不走模型）。回复文本不带「喵」，发送层会统一补。
+  - name: jb
+    keywords: ["jb"]
+    mode: contains
+    max_len: 20          # 短词，别让长句里捎带一个 jb 就触发
+    replies: ["不要，拿走"]
+    priority: 58
+    cooldown: 30
+
+  - name: 阳痿
+    keywords: ["阳痿", "阳萎"]      # 带错别字变体（OCR 也常读成这样）
+    mode: contains
+    replies: ["杂鱼起不来了"]
+    priority: 58
+    cooldown: 30
+
+  - name: 草
+    # ★ 2026-10-06 用户改口径：**不再用单字「草」**（草地/草稿/草莓/「我草」全误触），
+    #   只认这几个词。关键词够具体，原来的 max_len 长度限制已一并去掉。
+    #   要加变体往这个列表里塞即可（草你 / 草我 / 草死 …）。
+    keywords: ["草你", "草我", "草死"]
+    mode: contains
+    replies: ["真的要草吗"]
+    priority: 58
+    cooldown: 30
+
+  # ---- 2026-10-03 用户点名要的：看见「喵喵喵」就回「老吴！」（★唯一不加喵的）----
+  # ⚠️ 2026-10-04 用户明确要求：**「老吴！」这条不加喵**（"喵不加老吴"），
+  #    所以它是全局带喵之后唯一保留 no_meow 的规则。
+  # priority 47 要高于「猫猫」(28)，否则会被那条发图规则抢走。
+  # ★ 2026-10-09 用户改口径（原话：「关键词看见喵喵喵，喵一下，喵一声，输出
+  #   老吴~ 哦你个你个你个你个你个（嚼口香糖）后面不加喵」）：
+  #     · 关键词从一个扩到**三个**：喵喵喵 / 喵一下 / 喵一声；
+  #     · 回复换成新句，**仍然 no_meow**（不加喵 —— 这条是全局带喵之后唯一的例外）；
+  #     · 原来的「老吴！」**已被替换掉**，没留成随机候选（要留着随机抽就说一声）。
+  #   ⚠️ 别把 priority 降到 28 以下：那样会被「猫猫」发图规则抢走（它认单字「喵」）。
+  - name: 喵喵喵
+    keywords: ["喵喵喵", "喵一下", "喵一声"]
+    mode: contains
+    replies: ["老吴~ 哦你个你个你个你个你个（嚼口香糖）"]
+    priority: 47
+    cooldown: 30
+    no_meow: true
+
+  # ---- 2026-10-03 用户点名要的：说「熬夜冠军」就回「才不是喵」----
+  # 故意**不开** mention_exempt：被 @ 时也固定回这句，不走模型。
+  # 想让它被 @ 时交给模型好好答，就在下面补一行 mention_exempt: true。
+  - name: 熬夜冠军
+    keywords: ["熬夜冠军"]
+    mode: contains
+    replies: ["才不是喵"]
+    priority: 46
+    cooldown: 30
+
+  - name: 驰名
+    keywords: ["驰名"]
+    mode: contains
+    replies: ["来驰"]
+    priority: 45
+    cooldown: 30
+    mention_exempt: true
+
+  # ---- 2026-10-03 用户点名要的：看见「神了」就回「魔了」----
+  # 和「驰名」一样开了 mention_exempt：被 @ 时让位给模型，免得别人正经点你只回俩字。
+  - name: 神了
+    keywords: ["神了"]
+    mode: contains
+    replies: ["魔了"]
+    priority: 45
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 充值奇遇
+    keywords: ["充值奇遇"]
+    mode: contains
+    replies: ["-648"]
+    priority: 45
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 睡觉
+    keywords: ["睡觉"]
+    mode: contains
+    replies: ["晚安"]
+    priority: 45
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 甜甜甜
+    keywords: ["甜甜甜"]
+    mode: contains
+    max_len: 15
+    replies: ["好甜", ]
+    priority: 40
+    cooldown: 30
+    mention_exempt: true
+
+  # ★ 2026-10-06 用户点名删掉：这里原来是 `keywords: ["99"]`（mode: exact，
+  #   回复 "99"）。理由跟「六」那条一样 —— **纯数字关键词会被照片上的数字误触**：
+  #   OCR 把图上的 "99" 读成一条独立短消息，正好全等命中。
+  #   别再照着老文档加回来。
+
+  # ★ 2026-10-10 用户要求：**回复候选只留一个** —— 原来 ["大大大", "大 大 大"]
+  #   随机换着来，他实际看到的是「一会儿 大大大喵、一会儿 大 大 大喵」，
+  #   感觉像重复唠叨。去掉「大 大 大」，以后只有「大大大喵」。
+  #   （他这次只选了这一项；匹配仍是 contains、冷却仍是 30 秒 —— 想再收紧
+  #   就改 mode: exact 或把 cooldown 加长，别再动候选。）
+  - name: 大大大
+    keywords: ["大大大"]
+    mode: contains
+    replies: ["大大大"]
+    priority: 40
+    cooldown: 30
+
+  # ---- 2026-10-03 用户要求：看见 dd / 滴滴 → 回「我也滴喵」或「滴滴我喵」----
+  # 注：replies 写不带喵的「我也滴 / 滴滴我」，发送层会自动补成「我也滴喵 / 滴滴我喵」。
+
+  - name: dd
+    keywords: ["dd"]
+    mode: contains
+    max_len: 12
+    replies: ["我也滴", "滴滴我"]
+    priority: 35
+    cooldown: 30
+
+  - name: 滴滴
+    keywords: ["滴滴"]
+    mode: contains
+    replies: ["我也滴", "滴滴我"]
+    priority: 35
+    cooldown: 30
+
+  - name: 萝莉
+    keywords: ["萝莉", "loli"]
+    mode: contains
+    replies: ["直接电", ]
+    priority: 50
+    cooldown: 30
+
+  - name: 甜妹
+    keywords: ["甜妹"]
+    mode: contains
+    replies: ["哪有甜妹", ]
+    priority: 50
+    cooldown: 30
+
+  - name: 御姐
+    keywords: ["御姐"]
+    mode: contains
+    replies: ["哪有御姐", ]
+    priority: 50
+    cooldown: 30
+
+  - name: 看看腿
+    keywords: ["看看腿", "看腿", "看个腿"]
+    mode: contains
+    replies: ["看看腿", ]
+    priority: 50
+    cooldown: 0
+
+  - name: 无敌
+    keywords: ["无敌"]
+    mode: contains
+    replies: ["谁在称无敌 哪个敢言不败",]
+    priority: 60
+    cooldown: 30
+
+  - name: 飞机
+    keywords: ["飞机"]
+    mode: contains
+    replies: ["起飞",]
+    priority: 45
+    cooldown: 30
+
+  - name: 人机
+    keywords: ["人机"]
+    mode: contains
+    max_len: 12
+    replies: ["你才人机", "你才人机 我炸了", "？ 你才人机", "你才人机 你全家都人机"]
+    priority: 55
+    cooldown: 30
+
+  # 【2026-10-04 用户要求删除】原「内功图」规则：
+  #   keywords: ["内功", "气海", "根骨"] → 回"这内功我看看"等 4 句
+  # 删因：机器人只看得到微信里的缩略图（约 320px 宽），内功/装备界面上的
+  # 属性小字根本 OCR 不出来，实测整块截图一个词条都没有 —— 这条规则等于
+  # 从来没触发过。（备份见 rules.yaml.bak-1004-drop-neigong）
+  # 注：读屏层「把图上的字追加到 [图片] 后面」的逻辑保留，那是通用行为、零额外开销，
+  # 万一哪天原图清晰了还能用。
+
+  # ---- 下面这几条是"泛化词"，被 @ 时让位给模型 ----
+
+  - name: 问号
+    keywords: ["？", "?"]
+    mode: contains
+    max_len: 30
+    replies: ["？"]
+    priority: 10
+    cooldown: 30
+    mention_exempt: true
+
+  # ★ 2026-10-05 用户点名删掉：「他把图片读成乱七八糟的文字。把这个 6666 这个
+  #   关键词删了吧，经常误读」—— 原来这里是一条 `keywords: ["6"]` 的规则
+  #   （回复 "6" / "666" / "别6"）。即使有 max_len: 8 也拦不住：照片/表情包上
+  #   的数字被 OCR 读成 "69" / "252" / "2E2" 这种短垃圾，长度刚好够，于是
+  #   机器人对着图片说「别6喵」。规则已删除，别再照着老文档加回来。
+  # ====================== 表情包（以发图为主）======================
+  #
+  #   action: image     命中后直接发一张图，不回文字
+  #   image_tag         文件名关键词，逗号分隔；命中任意一个的图都进候选池，
+  #                     然后从池子里随机抽一张
+  #
+  #   例：image_tag: 哭,呜,嘤
+  #       会命中 哭 / 哭_1 / 哭_2 / 大哭 / 快哭了 / 呜呜 / 嘤嘤嘤
+  #
+  #   优先级：下面这些数字比"你指定的"那批略低一点，所以
+  #   「6」「看看腿」「大大大」这类你点名要回文字的，仍然回文字。
+  #   想让表情包彻底盖过文字，把对应规则的 priority 调高就行。
+
+  - name: 疑问脸
+    keywords: ["为什么", "为啥", "怎么回事", "什么鬼", "真的吗", "是吗", "不懂", "啥意思", "咋回事"]
+    mode: contains
+    action: image
+    image_tag: ？,不知道啊,这不对吧,怎么会这样,啊原来这样呀,我看看怎么个事,我倒要看看,思考
+    priority: 30
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 笑
+    keywords: ["笑死", "哈哈哈", "绷不住", "笑不活", "乐死", "嘻嘻", "嘿嘿"]
+    mode: contains
+    action: image
+    image_tag: 笑,哈哈,嘻,嘿,噗,噎住,开心,快哉
+    priority: 32
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 哭
+    # ⚠️ 2026-10-07：改成 regex 只为把「破防」精确化 —— 这串瓜的主角之一叫
+    #   「破防姐」，contains 会把她的名字也当成“破防”（一聊到她就发哭表情包，
+    #   抢掉吃瓜互动）。「破防(?!姐)」= 破防后面不跟“姐”才命中，其余关键词行为不变。
+    keywords: ["哭了", "想哭", "难受", "委屈", "破防(?!姐)", "emo", "好惨"]
+    mode: regex
+    action: image
+    image_tag: 哭,呜,嘤,落泪,可怜,委屈,垂头丧气,忧郁,自闭,生无可恋,颓废,柔弱
+    priority: 30
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 生气
+    keywords: ["生气", "气死", "气人", "烦死", "可恶", "恼火", "上火"]
+    mode: contains
+    action: image
+    image_tag: 生气,气鼓鼓,我生气了,准备生气,哼,哈气,闹
+    priority: 30
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 猫猫
+    keywords: ["猫", "喵", "咪", "可爱", "好萌"]
+    mode: contains
+    action: image
+    image_tag: 喵,咪,猫,摇尾巴,贴,抱抱,抱着,舔
+    priority: 28
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 震惊
+    keywords: ["卧槽", "我靠", "天哪", "妈呀", "吓人", "惊了", "牛逼"]
+    mode: contains
+    action: image
+    image_tag: 惊,被吓,害怕,我的天,瞪大眼睛,！
+    priority: 34
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 无语
+    keywords: ["无语", "服了", "离谱", "说不出话"]
+    mode: contains
+    action: image
+    image_tag: 无语,不语,阿巴阿巴,痴傻,模糊,亖,长舒一口气,辛苦了
+    priority: 33
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 馋了
+    keywords: ["爱了", "好喜欢", "亲一个", "馋了", "好色"]
+    mode: contains
+    action: image
+    image_tag: 爱你,mua,双眼冒爱心,害羞,亲,摁床上,馋
+    priority: 26
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 干饭
+    keywords: ["好吃"]
+    mode: contains
+    action: image
+    image_tag: 吃,嚼
+    priority: 24
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 偷看
+    keywords: ["看看你", "康康", "瞅瞅", "偷看"]
+    mode: contains
+    action: image
+    image_tag: 偷瞄,探头,看,歪头,仔细看,蜷缩着看你
+    priority: 24
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 打闹
+    keywords: ["咬你", "打死你", "捶你", "踢你", "掐你"]
+    mode: contains
+    action: image
+    image_tag: 咬,敲你脑袋,打手手,掐脖子,啃你的脚,指你,挠头,对手指
+    priority: 30
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 嘲讽
+    keywords: ["就这", "菜鸡", "弱爆", "不行啊", "笨蛋", "傻子"]
+    mode: contains
+    action: image
+    image_tag: 杂鱼,你能拿我怎样,你怎么这么坏,笨蛋,略,桀桀桀,嫌弃,鬼点子,针对我,我下的任务罢了
+    priority: 34
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 赞同
+    keywords: ["可以啊", "不错", "挺好", "厉害了", "牛啊", "行吧"]
+    mode: contains
+    action: image
+    image_tag: OK,是的,行吧,赞,很好,乖巧,赔笑
+    priority: 22
+    cooldown: 30
+    mention_exempt: true
+
+  - name: 摆烂
+    keywords: ["摆烂", "躺平", "好累", "累了", "睡了", "下班"]
+    mode: contains
+    action: image
+    image_tag: 我活到头了,趴,躲,上吊,蟑螂,打哈欠,晚安,在干嘛,求,投降
+    priority: 30
+    cooldown: 30
+    mention_exempt: true

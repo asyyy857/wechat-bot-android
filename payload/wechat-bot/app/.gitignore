@@ -1,0 +1,50 @@
+# ============================================================
+# 微信机器人 · 版本控制忽略清单
+# 原则：代码/配置/文档入库；数据/日志/素材/密钥/备份不入库
+# 2026-10-11 建立
+# ============================================================
+
+# ── 密钥（绝不入库）──
+.deepseek_key
+*.key
+*.pem
+.env
+.env.*
+
+# ── 运行时数据（含真实聊天记录与发送记录）──
+chat_log.json
+sent.jsonl
+rejects.jsonl
+drafts.lock
+governor_sent.json
+ppt_seen.json
+agent_used.json
+nsh_learn_state.json
+演练台.json
+演练评价.json
+tuning.json
+
+# ── 日志 ──
+bot.log
+*.log
+
+# ── 素材与模型（体积大）──
+models/
+表情包/
+美图库/
+美图缓存/
+
+# ── 手工备份（git 接管后不再需要）──
+历史备份/
+*.bak
+*.bak-*
+
+# ── Python 缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+
+# ── 临时与调试 ──
+tmp/
+debug/
+.trashed-*

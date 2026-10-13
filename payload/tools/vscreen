@@ -1,0 +1,193 @@
+#!/usr/bin/env node
+/**
+ * vscreen —— 受信任虚拟屏客户端（零第三方依赖，只要有 node）
+ *
+ *   vscreen list                          列出所有虚拟屏
+ *   vscreen -i N info                     该屏信息
+ *   vscreen -i N shot <文件> [--w W]      抓当前帧存 JPEG（给人看 / 给 OCR）
+ *   vscreen -i N tap X Y                  点（该屏自身坐标系）
+ *   vscreen -i N swipe X1 Y1 X2 Y2 [MS]   滑
+ *   vscreen -i N key <NAME>               按键
+ *   vscreen -i N text <文本>              输入（仅 ASCII 可靠）
+ *   vscreen -i N res full|half|quarter    同 dp 切档
+ *   vscreen -i N resize W H [DPI]         直接改像素
+ *   vscreen -i N launch <PKG> [ACT]       副屏 freeform 启动应用
+ *   vscreen -i N seq [--gap 1200]         从 stdin 读一连串输入，单进程连打（省 node 启动）
+ *                                         每行: <input 参数> [@延迟ms]   # 开头为注释
+ *                                         例:  swipe 700 300 700 306 110 @1200
+ *
+ * 输入注入优先走【命令端点守护 :18252】；不可用则回退 adb。
+ */
+const http = require('http');
+const fs = require('fs');
+
+const ROOT = process.env.DSH_ROOT || '/sdcard/dsh';
+// ⚠️ 默认端口必须和 env.sh 保持一致：18240/18242 在本机被「失效端口绑定」劫持
+//    ——TCP 连得上但永远不回数据，谁连谁挂（2026-10-03 起改用 18250/18252）。
+//    显式传了 VSD_PORT/SHD_PORT 时仍以环境变量为准（wxbridge_ctl.sh 就是这么传的）。
+const VSD_PORT = +(process.env.VSD_PORT || 18250);
+const SHD_PORT = +(process.env.SHD_PORT || 18252);
+
+const argv = process.argv.slice(2);
+function opt(name, def) {
+  const i = argv.indexOf(name);
+  return i >= 0 && argv[i + 1] !== undefined ? argv[i + 1] : def;
+}
+const idxArg = opt('-i', opt('--display', null));
+const idx = idxArg !== null ? parseInt(idxArg, 10) : null;
+const pos = [];
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '-i' || argv[i] === '--display' || argv[i] === '--w') { i++; continue; }
+  pos.push(argv[i]);
+}
+const cmd = pos[0];
+
+function fail(msg) { console.error('  ❌ ' + msg); process.exit(1); }
+
+// 通用请求：body 为 Buffer 时显式带 Content-Length（守护按该头读正文）
+function request(port, method, path, body, headers, cb) {
+  const hs = Object.assign({}, headers || {});
+  if (body && !hs['Content-Length']) hs['Content-Length'] = body.length;
+  const r = http.request({ host: '127.0.0.1', port, path, method, timeout: 30000, headers: hs }, res => {
+    const chunks = [];
+    res.on('data', c => chunks.push(c));
+    res.on('end', () => cb(null, res.statusCode, Buffer.concat(chunks), res.headers));
+  });
+  r.on('timeout', () => r.destroy(new Error('timeout')));
+  r.on('error', e => cb(e));
+  if (body) r.write(body);
+  r.end();
+}
+
+function getJson(path, cb) {
+  request(VSD_PORT, 'GET', path, null, null, (e, code, buf) => {
+    if (e) return cb(e);
+    try { cb(null, JSON.parse(buf.toString('utf8'))); }
+    catch (x) { cb(new Error('非 JSON 响应: ' + buf.toString('utf8').slice(0, 120))); }
+  });
+}
+
+function postJson(path, obj, cb) {
+  const body = Buffer.from(JSON.stringify(obj), 'utf8');
+  request(VSD_PORT, 'POST', path, body, { 'Content-Type': 'application/json' }, (e, code, buf) => {
+    if (e) return cb(e);
+    if (code !== 200) return cb(new Error('HTTP ' + code + ': ' + buf.toString('utf8').slice(0, 120)));
+    cb(null, buf.toString('utf8'));
+  });
+}
+
+function withDisplay(fn) {
+  if (idx === null || isNaN(idx)) fail('需要 -i <屏索引>');
+  getJson('/list', (e, list) => {
+    if (e) return fail('连接虚拟屏守护 :' + VSD_PORT + ' 失败（' + e.message + '）—— 先跑 ensure-vsd.sh');
+    if (!Array.isArray(list)) return fail('守护返回异常');
+    const slot = list.find(s => s.i === idx);
+    if (!slot) return fail('没有屏 ' + idx + '（现有: ' + list.map(s => s.i).join(',') + '）');
+    fn(slot);
+  });
+}
+
+// 以 shell 身份执行：优先命令守护，回退 adb
+function sh(cmdline, cb) {
+  let token = '';
+  try { token = fs.readFileSync(ROOT + '/.shd-token', 'utf8').trim(); } catch (x) {}
+  const body = Buffer.from(cmdline, 'utf8');
+  request(SHD_PORT, 'POST', '/exec', body, { 'X-Token': token }, (e, code, buf) => {
+    if (!e && code === 200) return cb(null, buf.toString('utf8'));
+    try {
+      const { execFileSync } = require('child_process');
+      const serial = fs.readFileSync(ROOT + '/.adb-serial', 'utf8').trim();
+      cb(null, execFileSync('adb', ['-s', serial, 'shell', cmdline], { encoding: 'utf8', timeout: 30000 }) + '[EXIT=via-adb]\n');
+    } catch (x) { cb(e || x); }
+  });
+}
+
+function inputOn(slot, args) {
+  sh('input -d ' + slot.displayId + ' ' + args, (e, out) => {
+    if (e) return fail('输入失败（命令守护与 adb 都不可用）: ' + e.message);
+    console.log('  ✅ input -d ' + slot.displayId + ' ' + args + '  →  ' + String(out).trim().split('\n')[0]);
+  });
+}
+
+switch (cmd) {
+  case 'list':
+    getJson('/list', (e, j) => e ? fail('连接 :' + VSD_PORT + ' 失败（' + e.message + '）') : console.log(JSON.stringify(j, null, 2)));
+    break;
+
+  case 'info':
+    withDisplay(s => getJson('/' + idx + '/info', (e, j) => e ? fail(e.message) : console.log(JSON.stringify(j, null, 2))));
+    break;
+
+  case 'shot': {
+    const file = pos[1];
+    const w = opt('--w', null);
+    if (!file) fail('用法: vscreen -i N shot <文件> [--w W]');
+    withDisplay(s => {
+      request(VSD_PORT, 'GET', '/' + idx + '/frame' + (w ? '?w=' + w : ''), null, null, (e, code, buf, hd) => {
+        if (e) return fail('取帧失败: ' + e.message);
+        const ct = (hd && hd['content-type']) || '';
+        if (!/jpeg|image/.test(ct)) return fail('守护没给图：' + buf.toString('utf8').slice(0, 80) + '（屏上可能还没出帧）');
+        fs.writeFileSync(file, buf);
+        console.log('  ✅ 已存 ' + file + '（' + buf.length + ' 字节, ' + s.width + 'x' + s.height + ', frames=' + s.frames + '）');
+      });
+    });
+    break;
+  }
+
+  case 'tap':      withDisplay(s => inputOn(s, 'tap ' + pos[1] + ' ' + pos[2])); break;
+  case 'swipe':    withDisplay(s => inputOn(s, 'swipe ' + pos[1] + ' ' + pos[2] + ' ' + pos[3] + ' ' + pos[4] + (pos[5] ? ' ' + pos[5] : ''))); break;
+  case 'key':      withDisplay(s => inputOn(s, 'keyevent ' + pos[1])); break;
+  case 'text':     withDisplay(s => inputOn(s, 'text "' + String(pos[1]).replace(/"/g, '\\"') + '"')); break;
+
+  // 批量输入：从 stdin 读指令，同一个进程依次执行，省掉每次 ~150ms 的 node 冷启动
+  case 'seq': {
+    if (idx === null) fail('需要 -i <屏索引>');
+    let raw = '';
+    try { raw = fs.readFileSync(0, 'utf8'); } catch (x) {}
+    const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+    if (!lines.length) fail('stdin 没有指令');
+    const defGap = +(opt('--gap', 1200)) || 0;
+    withDisplay(s => {
+      let i = 0;
+      const step = () => {
+        if (i >= lines.length) { console.log('  ✅ seq 完成 ' + lines.length + ' 步'); return; }
+        let line = lines[i++];
+        let gap = defGap;
+        const m = line.match(/@(\d+)\s*$/);
+        if (m) { gap = +m[1]; line = line.slice(0, m.index).trim(); }
+        sh('input -d ' + s.displayId + ' ' + line, (e, out) => {
+          if (e) return fail('第 ' + i + ' 步失败: ' + e.message);
+          console.log('  [' + i + '/' + lines.length + '] ' + line + (gap ? '  +' + gap + 'ms' : ''));
+          // ★ 2026-10-11 修 seq 的「最后一行不等 @延迟」bug：原来这里有一行
+          //   `if (i >= lines.length) { 打印完成; return; }` —— 它发生在 setTimeout 之前，
+          //   于是**单行 seq 的 @延迟 100% 被跳过**（实测：朋友圈点卡 `swipe ... @8000`
+          //   实际 0ms 返回，脚本 2s 后就抓帧 → 抓到的还是青崖书 → 后续 19 个候选
+          //   全点在青崖书上、Δ 全 0，白烧 501s）。
+          //   现在统一交给 setTimeout(step, gap)：step 自己会在没有下一行时收尾。
+          setTimeout(step, gap);
+        });
+      };
+      step();
+    });
+    break;
+  }
+
+  case 'res':
+    if (idx === null) fail('需要 -i <屏索引>');
+    postJson('/res', { i: idx, level: pos[1] || 'half' }, (e, out) => e ? fail(e.message) : console.log('  ' + out));
+    break;
+
+  case 'resize':
+    if (idx === null) fail('需要 -i <屏索引>');
+    postJson('/resize', { i: idx, width: +pos[1], height: +pos[2], dpi: pos[3] ? +pos[3] : 0 }, (e, out) => e ? fail(e.message) : console.log('  ' + out));
+    break;
+
+  case 'launch':
+    if (idx === null) fail('需要 -i <屏索引>');
+    postJson('/launch', { i: idx, pkg: pos[1], act: pos[2] || null, wm: 5 }, (e, out) => e ? fail(e.message) : console.log('  ' + out));
+    break;
+
+  default:
+    console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).map(l => l.replace(/^ \* ?/, '')).join('\n'));
+    process.exit(cmd ? 2 : 0);
+}

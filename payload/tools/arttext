@@ -1,0 +1,3 @@
+#!/bin/sh
+# 艺术字出图入口：arttext "文字" -o 输出.png [--style jin|bai|qing|mo] [--font shufa|xingshu|xingkai|caoshu|kai|hei]
+exec python3 /sdcard/dsh/tools/arttext.py "$@"

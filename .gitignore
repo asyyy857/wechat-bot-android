@@ -1,0 +1,7 @@
+# ★ 大文件走 GitHub Release 附件，不进仓库（GitHub 单文件 >100MB 会被拒）
+payload/ocrlibs.tar.gz
+payload/wechat-bot/app/models/
+payload/vscreen-src/*.jar
+__pycache__/
+*.pyc
+.DS_Store
