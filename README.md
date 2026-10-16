@@ -59,11 +59,11 @@
 
 ## 装起来
 
-**[⬇️ 下载《微信机器人-v2.1.3-傻瓜式一键安装》](https://github.com/asyyy857/wechat-bot-android/releases/latest)**
-（发布包自带 DSH 安装包与虚拟屏插件）
+**[⬇️ 下载安装包 · 傻瓜式一键安装（283 MB）](https://github.com/asyyy857/wechat-bot-android/releases/latest)**
+（文件名 `wechat-bot-v2.1.3-one-click-install.zip`；发布包自带 DSH 安装包与虚拟屏插件）
 
 ```sh
-cd /sdcard/Download && unzip 微信机器人-v2.1.3-傻瓜式一键安装.zip -d /sdcard/dsh/
+cd /sdcard/Download && unzip wechat-bot-v2.1.3-one-click-install.zip -d /sdcard/dsh/
 cd /sdcard/dsh/微信机器人-v2.1.3
 sh install.sh          # ⚠️ 必须 sh 开头，/sdcard 是 noexec
 ```
