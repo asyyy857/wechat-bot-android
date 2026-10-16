@@ -8,7 +8,7 @@
 
     GET  /snapshot
         -> {"ok": true,
-            "chat_title": "目标群名",
+            "chat_title": "示例群名",
             "messages": [
                 {"text": "看看腿",     "is_self": false},
                 {"text": "我先测两天", "is_self": true}
@@ -68,19 +68,19 @@ def _strip_title_noise(shown: str) -> str:
     于是永远判「不是目标群」，机器人一直「待命中」什么都不回（进程却好好的）。
     """
     s = (shown or "").strip().strip(_TITLE_DECOR).strip()
-    # 人数尾巴实测四种形态：(111) / (111 / 111) / (111人) / 「人间...(111人)」
+    # 人数尾巴实测四种形态：(111) / (111 / 111) / (111人) / 「示例...(111人)」
     # —— 只认带括号或「人/名」的，别把「群2024」这种真群名吃掉；
     #   也别把 `.` 写进数字字符类：那样会把省略号一起吃掉，只剩一个字的头部。
     s = re.sub(r"(?:[\(（]\s*\d+\s*(?:人|名)?\s*[\)）]?|"
                r"\d+\s*(?:人|名)?\s*[\)）])\s*$", "", s).strip()
-    # 带省略号说明标题被截断过，后面挂的裸数字也是人数：'人间...111'
+    # 带省略号说明标题被截断过，后面挂的裸数字也是人数：'示例...111'
     if re.search(r"\.{2,}", s):
         s = re.sub(r"\d+\s*$", "", s).strip()
     return s.strip(_TITLE_DECOR).strip()
 
 
 def title_matches(shown: str, target: str) -> bool:
-    """会话标题匹配，容忍微信的「目标群...录」式截断。"""
+    """会话标题匹配，容忍微信的「示例群名...录」式截断。"""
     shown = _strip_title_noise(normalize(shown).replace("…", "..."))
     target = normalize(target)
     if not shown or not target:
@@ -106,9 +106,9 @@ def title_matches(shown: str, target: str) -> bool:
         # 尾部剥干净了才敢放行单字 head（群名被截到只剩一个字），
         # 但目标群名得够长 —— 免得「人」这种单字把别的会话也认成目标群
         # ★ 2026-10-10 实测修正：原来卡的是 `len(target) >= 4`，**3 个字的
-        #   群名会被这条一律判否**。用户把群备注改成「目标群窝」之后，微信标题栏
+        #   群名会被这条一律判否**。用户把群备注改成「群备注名」之后，微信标题栏
         #   变成两行（第一行「备注 + (人数)」、第二行原群名），两行都被虚拟屏的
-        #   窄宽度压扁 —— 实测读到的是 `缺...10` / `「人间.`，第一行只剩一个
+        #   窄宽度压扁 —— 实测读到的是 `缺...10` / `「示例.`，第一行只剩一个
         #   「缺」字，于是机器人**认为自己不在目标群**、每 3 轮白切一次群
         #   （当天日志累计 135 次「连续 3 轮不在目标群」）。
         #   现在放宽成 `len(target) >= 2`：单字 head 仍然必须**正好是目标群名的
@@ -318,6 +318,8 @@ class AndroidSender(_Bridge):
         self.last_record_error = ""
         # ★ 2026-10-10：最近一次「往回翻补读」的失败原因（桥接 /backfill）。
         self.last_backfill_error = ""
+        # ★ 2026-10-15：最近一次「点图放大」的失败原因（桥接 /zoom_image）。
+        self.last_zoom_error = ""
 
     def send(self, text: str) -> bool:
         text = (text or "").strip()
@@ -410,6 +412,29 @@ class AndroidSender(_Bridge):
             self.last_image_retryable = False
         return ok
 
+    def zoom_image(self, img_hash: str = "", sender: str = "") -> Optional[dict]:
+        """把屏幕上那张图**点开放大**、截一张、立刻退回（返回放大图路径）。
+
+        ★ 2026-10-15（用户实测确认后才加）：聊天页里缩略图上的小字 OCR 出来是乱码
+          （「而明的汗(燃贸穴就口*不填它就田坝」），而点开进图片查看器后大图清清楚楚
+          （同一次实测读出了整段短剧文案）。走桥接 ``POST /zoom_image``。
+        选图用 ``img_hash``（aHash 匹配，不受昵称抖动影响）。
+        失败返回 None（原因在 ``last_zoom_error``）。
+        """
+        try:
+            data = self._request("/zoom_image",
+                                 {"img_hash": str(img_hash or ""),
+                                  "sender": str(sender or "")},
+                                 timeout=120)
+        except Exception as exc:
+            self.last_zoom_error = "点图放大请求异常（%s）" % type(exc).__name__
+            return None
+        if not data or not data.get("ok"):
+            self.last_zoom_error = str((data or {}).get("error") or "桥接没回话")
+            return None
+        self.last_zoom_error = ""
+        return data
+
     def read_record(self, match: str = "") -> Optional[dict]:
         """点开屏幕上那张聊天记录卡片，把里面的文字读回来。
 
@@ -447,17 +472,22 @@ class AndroidSender(_Bridge):
         self.last_record_error = ""
         return data
 
-    def backfill(self, screens: int = 2, chat: str = "") -> Optional[dict]:
+    def backfill(self, screens: int = 2, chat: str = "",
+                 images: bool = False) -> Optional[dict]:
         """叫它往回翻补读：往上翻 N 屏把刷过去的消息读回来，再切回最新。
 
         ★ 2026-10-10 用户口径：**只在他叫的时候翻**（自动补读他选了不要）。
           桥接 /backfill 的实现里，翻完**必须**切回最新 —— 否则接下来几轮读到的
           全是历史消息，新消息反而全漏。耗时实测约 10 秒/屏（含 OCR + 滑块等待）。
+
+        ★ 2026-10-15：``images=True`` 时每屏的图片消息也带 ``img_path`` 回来
+          （被叫看图、而那张图已经刷上去时用，见 bot._scroll_back_for_image）。
         """
         try:
             data = self._request("/backfill",
                                  {"screens": int(screens or 2),
-                                  "chat": str(chat or self.target_group)},
+                                  "chat": str(chat or self.target_group),
+                                  "images": bool(images)},
                                  timeout=180)
         except Exception as exc:
             self.last_backfill_error = "补读请求异常（%s）" % type(exc).__name__
@@ -466,6 +496,32 @@ class AndroidSender(_Bridge):
             self.last_backfill_error = str((data or {}).get("error") or "桥接没回话")
             return None
         self.last_backfill_error = ""
+        return data
+
+    def read_card(self, sender: str = "", match: str = "") -> Optional[dict]:
+        """被叫读某条消息、而它不是图片时：点开这条整页 OCR。
+
+        ★ 2026-10-15（用户：「读一下张三的图片」→ 那张是**转发图文卡片**，
+          读屏层只给碎片文字）。走桥接 ``POST /read_card``：它按发送者昵称定位
+          （`_find_sender_block`）或按聊天记录标题定位，点开一次、整页 OCR、
+          立刻按返回退出。
+
+        ⚠️ **这一步会替用户点屏幕** —— 只在"被叫 + 本屏/翻屏都没有图"时才走
+          （bot.py::_read_card_and_comment）；群友随便 @ 一下走不到。
+        失败返回 None（原因在 ``last_record_error``）。
+        """
+        try:
+            data = self._request("/read_card",
+                                 {"sender": str(sender or ""),
+                                  "match": str(match or "")},
+                                 timeout=180)
+        except Exception as exc:
+            self.last_record_error = "读卡片请求异常（%s）" % type(exc).__name__
+            return None
+        if not data or not data.get("ok"):
+            self.last_record_error = str((data or {}).get("error") or "桥接没回话")
+            return None
+        self.last_record_error = ""
         return data
 
     def is_ready(self) -> bool:

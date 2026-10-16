@@ -3,7 +3,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-ROOT = Path(r"C:\Users\18863\Documents\deepseek-harness\default-workspace\wechat-auto\表情包")
+ROOT = Path(r"改成你自己的路径")
 FONT_PATH = r"C:\Windows\Fonts\msyh.ttc"
 S = 240
 

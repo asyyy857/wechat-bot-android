@@ -98,7 +98,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="列出全部记忆")
     ap.add_argument("--kind", choices=("person", "topic"), help="配合 --list 过滤")
     ap.add_argument("--add", nargs=3, metavar=("KIND", "NAME", "NOTE"),
-                    help="加一条：--add person 某群友 \"爱发水獭表情包\"")
+                    help="加一条：--add person 张三 \"爱发水獭表情包\"")
     ap.add_argument("--alias", action="append", default=[], help="别名，可重复 --alias")
     ap.add_argument("--pri", type=float, default=0, help="优先级（越大越靠前）")
     ap.add_argument("--del", dest="delete", metavar="名字", help="删除（按名字/别名）")

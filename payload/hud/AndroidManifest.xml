@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dsh.hud"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="22" />
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- ★ 2026-10-08：干完活要能「叫醒」锁屏的用户 —— 见 HudService.vibrate 的注释 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:label="DSH 浮窗"
+        android:allowBackup="false"
+        android:hardwareAccelerated="true">
+
+        <activity
+            android:name=".BootActivity"
+            android:label="DSH 浮窗"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".HudService"
+            android:exported="true"
+            android:label="DSH 浮窗" />
+    </application>
+</manifest>

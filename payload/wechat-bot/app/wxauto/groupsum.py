@@ -46,6 +46,9 @@ DEFAULTS = {
     "inject_chars": 400,         # 注入总字数上限
     "max_lines": 400,            # 单段最多喂多少行给模型
     "max_input_chars": 6000,     # 单段输入字符上限
+    # ★ 2026-10-15 加：模型没给出可用摘要时，多久之后才允许再试一次。
+    #   没有它就会每轮（4 秒）重试一次，见 maybe_run 里的说明。
+    "retry_cooldown_secs": 300,
 }
 
 
@@ -151,6 +154,10 @@ def summarize(brain, lines, max_chars: int, log=None) -> str:
                 {"role": "user", "content": _build_prompt(lines, max_chars)},
             ],
             "max_tokens": 400, "temperature": 0.2, "stream": False,
+            # ★ 2026-10-15（修 bug）：摘要属于「抽取」，不能被自动补 reasoning_effort
+            #   —— 实测传 low 时 400 token 全被 reasoning 吃光、正文 0 字，
+            #   于是每轮丢空、每轮重试。详见 brain._post 的 `_no_effort`。
+            "_no_effort": True,
         }
         body = brain._post(payload)
         raw = ""
@@ -219,6 +226,16 @@ def maybe_run(brain, base_dir, log=None, cfg=None, force: bool = False,
         if last_to <= 0:
             # 第一次跑：只看最近一个 interval，别把一整天都吞进来
             last_to = t_now - interval
+        # ★ 2026-10-15（修 bug）：失败也要有**重试冷却**。
+        #   原来失败不推进 last_to（本意"下一段再补"），但上面的到点判据用的就是
+        #   last_to —— 于是主循环**每一轮（4 秒）**都重新调一次模型。实测
+        #   2026-10-15 一次失败后连着重试 **1742 次**（bot.log 里 1742 条
+        #   "群情摘要被丢弃"），白烧 token、还把日志刷满。
+        cool = max(0.0, float(_cfg("retry_cooldown_secs")))
+        last_try = float(st.get("last_try") or 0.0)
+        if not force and cool and t_now - last_try < cool:
+            rep["reason"] = "上次失败，冷却中（%.0f 秒后再试）" % (cool - (t_now - last_try))
+            return rep
         if not force and t_now - last_to < interval:
             rep["reason"] = "还没到点（%.0f 秒后再看）" % (interval - (t_now - last_to))
             return rep
@@ -250,7 +267,12 @@ def maybe_run(brain, base_dir, log=None, cfg=None, force: bool = False,
 
         text = summarize(brain, lines, int(_cfg("max_chars")), log=log)
         if not text:
-            # 失败**不推进 last_to** —— 下一轮（interval 之后）重试这一段
+            # 失败**不推进 last_to**（这一段下次还补），但记一笔 last_try，
+            # 冷却期内不再重试（见上面的 cool 判断）。
+            st["last_try"] = t_now
+            st["version"] = VERSION
+            if not dry_run:
+                atomic_write_json(path, st)
             rep["reason"] = "模型没给出可用的摘要"
             return rep
 

@@ -10,7 +10,7 @@
 
 用法::
 
-    cd /sdcard/dsh/wechat-auto
+    cd /sdcard/dsh/wechat-bot/app
     python3 simulate.py                        # 人看的文本
     python3 simulate.py --json --count 8       # 给控制面板用（结构化，日志走 stderr）
     python3 simulate.py --count 12
@@ -32,7 +32,11 @@ import sys
 import time
 import urllib.request
 
-ROOT = "/sdcard/dsh/wechat-auto"
+# ⚠️ 2026-10-13：原来这里写死 v1 目录 `/sdcard/dsh/wechat-bot/app` 并插到 sys.path
+#   **最前面** —— 而那个目录里**也有 wxauto/**，于是面板生成回复时 import 的是
+#   **v1 的旧代码 / 旧 config / 旧人设**，跟正在跑的机器人不是一套（v2.0.0 之后
+#   程序在 app/、数据在 data/）。现在一律以本文件所在的 app/ 为准。
+ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 # 容器是 UTC，比手机（北京时间）慢 8 小时 —— 人设时段表靠本地时间判断，
@@ -43,7 +47,11 @@ try:
 except Exception:      # pragma: no cover
     pass
 
-KEY_FILE = os.path.join(ROOT, ".deepseek_key")
+try:                      # 凭据在数据目录（v2.0.0 起 app/ 与 data/ 分离）
+    from wxauto.paths import DATA_DIR as _DATA_DIR
+except Exception:         # pragma: no cover
+    _DATA_DIR = ROOT
+KEY_FILE = os.path.join(str(_DATA_DIR), ".deepseek_key")
 
 from wxauto.brain import Brain                       # noqa: E402
 from wxauto.config import (load_config, load_persona,  # noqa: E402

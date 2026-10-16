@@ -489,7 +489,7 @@ try:
 
     # ★ 用户 2026-10-05 下午补的要求：「发出去的也能记住对吧？别光记不发的」
     #   目的是攒素材，以后总结他要的那种说话风格。
-    _drafts.note_sent("主人点头的这句喵", origin="approve", src="群里原话", who="群友A")
+    _drafts.note_sent("主人点头的这句喵", origin="approve", src="群里原话", who="张三")
     _drafts.note_sent("机器人原稿喵", origin="approve")
     _drafts.note_sent("改完的这句喵", origin="edited", draft="机器人原稿喵")
     _drafts.note_sent("它自己回的那句喵", origin="reply")

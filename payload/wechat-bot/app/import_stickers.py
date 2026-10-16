@@ -5,9 +5,9 @@ import shutil
 import zipfile
 from pathlib import Path
 
-ROOT = Path(r"C:\Users\18863\Documents\deepseek-harness\default-workspace\wechat-auto")
+ROOT = Path(r"改成你的 wechat-bot/app 目录")        # 例：C:\Users\你的用户名\...\wechat-bot\app
 STICKERS = ROOT / "表情包"
-P = Path(r"C:\Users\18863\Documents\xwechat_files\wxid_fx7t92pk3qsu22_ef60\msg\file\2026-10\stickers_20260523_193056.zip")
+P = Path(r"改成你的贴纸 zip 路径")                  # 微信里收到的那个 zip
 
 # 1) 清掉我造的占位图
 removed = 0

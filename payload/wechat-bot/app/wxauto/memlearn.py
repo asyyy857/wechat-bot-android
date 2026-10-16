@@ -23,12 +23,19 @@ import time
 from pathlib import Path
 
 from .atomic import atomic_write_json
-from .memory import Memory, KINDS
+from .memory import Memory, KINDS, _norm
 
 STATE_FILE = "记忆_auto.json"
-MIN_LINES = 10          # 流水太少就别浪费一次调用
-MAX_LEN_NAME = 12
-MAX_LEN_NOTE = 60
+# ★ 2026-10-15 用户要求「记忆库判据松一点」。原来的三道判据都偏紧，实测代价：
+#   · MIN_LINES=10  → 夜里流水 6~9 条的日子直接不学；
+#   · MAX_LEN_NAME=12 → 长昵称（「某某（emo版）」「张三（今晚打本）」）
+#     连**候选说话人**都进不去 senders，模型学出来的人一律被机械校验毙掉；
+#   · MAX_LEN_NOTE=60 → 模型多写半句就被整条丢。
+#   下面放宽，但**不放掉机械校验**（那是防"把梗当人"的关键，见 learn()）。
+MIN_LINES = 5           # 流水太少就别浪费一次调用（5 条起）
+MAX_LEN_NAME = 16       # 单条记忆的名字上限（放宽后长昵称也能进）
+MAX_LEN_NOTE = 80       # note 上限（prompt 仍要求 40 字以内；这只是解析兜底）
+MAX_SENDER_LEN = 24     # senders（"真说过话的昵称"白名单）的长度上限
 
 
 def _load_state(path) -> dict:
@@ -71,7 +78,11 @@ def recent_lines(chat_path, hours: float, max_lines: int = 400,
         txt = " ".join(str(m.get("text") or "").split())
         if not txt:
             continue
-        if who != "?" and 2 <= len(who) <= MAX_LEN_NAME:
+        # ★ 2026-10-15 放宽：原来要求昵称 2~12 字才算"候选人"，
+        #   长昵称（带括号后缀那种）整批进不了白名单 → 模型学出来的人全被丢掉。
+        #   现在只排除**明显是 OCR 整行误判**的（含冒号的 "六少：怎么了" 这种）。
+        if (who != "?" and len(who) <= MAX_SENDER_LEN
+                and "：" not in who and ":" not in who):
             senders.add(who)
         line = "%s：%s" % (who, txt[:80])
         if len(out) >= max_lines or chars + len(line) > max_chars:
@@ -133,7 +144,12 @@ def _parse_items(raw: str, max_items: int):
             continue
         kind = str(it.get("kind") or "").strip().lower()
         if kind not in KINDS:
-            kind = "person" if kind in ("people", "人") else "topic"
+            # ★ 2026-10-15 放宽：模型写 people / 人物 / 群友 / name 之类也要认成
+            #   person（原来只认 "people"/"人"，其余一律当 topic —— 人就被记成梗）。
+            kind = ("person"
+                    if any(w in kind for w in ("person", "people", "人", "name",
+                                               "群友", "成员"))
+                    else "topic")
         name = " ".join(str(it.get("name") or "").split()).strip("。，,、：:")
         note = " ".join(str(it.get("note") or "").split()).strip()
         if not (2 <= len(name) <= MAX_LEN_NAME):
@@ -202,6 +218,10 @@ def learn(brain, base_dir, log=None, hours: float = 24, max_items: int = 5,
                 {"role": "user", "content": prompt},
             ],
             "max_tokens": 500, "temperature": 0.2, "stream": False,
+            # ★ 2026-10-15（修 bug 的关键一行）：抽取类请求**不要**让 _post 自动补
+            #   reasoning_effort —— 实测传 high 时 reasoning 1392 字吃光 500 token、
+            #   JSON 被截断，记忆库连着两天学 0 条。详见 brain._post 的 `_no_effort`。
+            "_no_effort": True,
         }
         body = brain._post(payload)
         raw = ""
@@ -210,24 +230,41 @@ def learn(brain, base_dir, log=None, hours: float = 24, max_items: int = 5,
         except Exception:
             raw = ""
         items = _parse_items(raw, max_items)
+        # ★ 2026-10-15（用户问「记忆库正常工作吗」→ 发现连续两天 learned=0）：
+        #   把模型的**原始返回**留在报告里。之前只写一句「这次没有值得记的新东西」，
+        #   分不清三种情况：① 模型直接回了空数组；② 回了内容但 JSON 抠不出来；
+        #   ③ 解析出来了却被后面的机械校验/去重丢掉。实测复现：ran=true、
+        #   learned=0、**连 dropped 都没有** —— 连我这轮都只能靠猜。
+        rep["raw"] = (raw or "").strip()[:400]
         # ★ 2026-10-11 首次实测的教训：模型会把**梗**当成"人"（第一次跑就把
         #   「穿镜子」「奶奶的玲珑吸血鬼」写进了 person）。这里加一道**机械校验**
         #   （不花额外 token）：
         #     · person 的 name 必须是流水里真正说过的**昵称**（或其包含关系）；
         #     · topic 的 name 必须在流水正文里出现过。
+        # ★ 2026-10-15 用户要求「判据松一点」—— 校验**留着**（它是防"梗当人"的
+        #   关键），但比较改为**归一化**（去空白 + 小写，见 memory._norm），并给
+        #   person 补第二条通路（名字在流水里以「名字：」出现过）。原来的坑：
+        #   「某某 某某」这种带空格昵称、以及带括号的长昵称，模型怎么写都对不上，
+        #   整条被静默丢掉。
         text_all = "\n".join(lines)
+        text_norm = _norm(text_all)          # 抗 OCR / 昵称里的空格抖动
+        send_norm = [_norm(s) for s in senders if _norm(s)]
         kept = []
         for it in items:
             nm = it["name"]
+            k = _norm(nm)
             if it["kind"] == "person":
-                if not any(nm == sn or nm in sn or sn in nm for sn in senders):
+                if (not any(k and (k == sn or k in sn or sn in k) for sn in send_norm)
+                        and (k + "：") not in text_norm
+                        and (k + ":") not in text_norm):
                     continue
-            elif nm not in text_all:
+            elif k not in text_norm:
                 continue
             kept.append(it)
         dropped = len(items) - len(kept)
         if dropped:
             rep["dropped"] = dropped
+            rep["dropped_names"] = [it["name"] for it in items if it not in kept][:5]
         items = kept
         rep["ran"] = True
         added = 0
@@ -241,7 +278,14 @@ def learn(brain, base_dir, log=None, hours: float = 24, max_items: int = 5,
         if added:
             _say("info", "记忆库自动整理：学了 %d 条 → %s" % (added, "；".join(rep["items"])))
         else:
-            _say("info", "记忆库自动整理：这次没有值得记的新东西")
+            # ★ 2026-10-15：日志带上足够排查的细节（原来只有一句"没有值得记的新东西"）
+            _say("info", "记忆库自动整理：没有学到的（模型回了 %d 字、解析出 %d 条、"
+                         "机械校验丢掉 %d 条%s）%s"
+                 % (len(raw or ""), len(items), int(rep.get("dropped") or 0),
+                    ("：" + "、".join(rep.get("dropped_names") or []))
+                    if rep.get("dropped_names") else "",
+                    ("，模型原文：" + (raw or "").strip().replace("\n", " ")[:160])
+                    if raw else ""))
         return rep
     except Exception as exc:                      # 绝不连累主循环
         rep["reason"] = "出错：%r" % (exc,)

@@ -520,6 +520,25 @@ SERIAL = _serial()
 ADB_RECHECK = 60.0        # 「adb 不可用」多久允许重探一次（秒）；见 adb_ok() 的说明
 _adb_state = {"ok": None, "at": 0.0}   # ok=最近一次探测结果；at=那次探测的时间
 
+def _serial_live():
+    """★2026-10-14：每次 adb 调用前重读 .adb-serial（旧的 SERIAL 只读一次）。
+
+    手机重启 / 重新配对之后，无线调试的地址和端口都会变（`connect-adb.sh`
+    会把新地址写进 .adb-serial），但桥接原来只在**进程启动时**读一次，
+    于是一直攥着旧串号，报 `adb: device '旧地址' not found` ——
+    **adb 明明是通的，机器人却照样瞎**（2026-10-14 实测踩到）。
+    串号真变了就换掉。**故意不动 `_adb_state`**：同一个设备只是换了地址，
+    真连不上时后续命令失败自会翻转状态；而且离线测试会把 `SERIAL` 打桩成假地址
+    （test_adb_classify.py），在这里重置 adb 状态会把打桩打坏（2026-10-14 踩过）。
+    """
+    global SERIAL
+    s = _serial()
+    if s and s != SERIAL:
+        print("[wxbridge] adb 串号已换：%s → %s（自动跟随）" % (SERIAL, s), flush=True)
+        SERIAL = s
+    return SERIAL
+
+
 # ★ 2026-10-12：adb 状态翻转统计（进 /health）+ 传输层故障判别。
 #   起因：桥接日志里反复出现「adb 直连 可用」→「adb 执行失败 → 改用命令守护」，
 #   而手动 `adb shell echo ok` 一直正常。根子在 `adb()` 原来拿 **returncode != 0**
@@ -567,8 +586,9 @@ def adb_ok(force=False):
             or (not _adb_state["ok"]
                 and time.time() - _adb_state["at"] > ADB_RECHECK)):
         ok = False
-        if SERIAL:
-            r = _run(["adb", "-s", SERIAL, "shell", "echo ok"], 12)
+        _s = _serial_live()
+        if _s:
+            r = _run(["adb", "-s", _s, "shell", "echo ok"], 12)
             ok = bool(r is not None and r.returncode == 0 and "ok" in (r.stdout or ""))
         _adb_state["ok"] = ok
         _adb_state["at"] = time.time()
@@ -587,7 +607,7 @@ def adb(cmd, timeout=30):
     """
     if adb_ok():
         _t0 = time.time()
-        r = _run(["adb", "-s", SERIAL, "shell", cmd], timeout)
+        r = _run(["adb", "-s", _serial_live(), "shell", cmd], timeout)
         if r is not None and r.returncode == 0:
             return (r.stdout or "").replace("\r", "").strip()
         if r is not None and not _adb_transport_failed(r):
@@ -1260,6 +1280,10 @@ NOTIFY_MIN_GAP = 60.0        # 秒：两条提醒之间至少隔这么久，别�
 # ★ 2026-10-12（用户：「通知栏这个抢屏可以关了」）：抢屏预告**不再往通知栏发**
 #   「微信机器人 · 要借一下屏」（那条是带横幅+响铃+连震三下的高优先级通知）。
 #   浮窗预告 + 一次震动照旧。想恢复：起桥接时带 `WXBRIDGE_ALARM=1`。
+# ★ 2026-10-14（用户要求「借屏只留浮窗，开始/结束各一条」）：**这个开关彻底不用了** ——
+#   桥接侧再也没有 `_hud_alarm()` 调用点（调用已注释在 `notify_user` 里）。
+#   常量与函数都保留：一是回滚方便，二是 `test_preflight.py` 会断言这行存在。
+#   借屏提示请统一走 `_hud_grab_start()` / `_hud_released()`。
 ALARM_ON = os.environ.get("WXBRIDGE_ALARM", "0") == "1"
 
 def _hud_notice(text, seconds=8, title="DSH 微信机器人", detail=None):
@@ -1300,7 +1324,18 @@ def _hud_buzz():
     ⚠️ 震动只能由 hud App 自己做（`cmd vibrator` 在本机根本不存在），
        见 HudService.vibrate()。异步起、绝不 wait，异常一律吞掉 ——
        提示失败绝不能影响发消息。
+
+    ★ 2026-10-13（用户要求，原话「机器人抢屏抢之前震的我一下，抢完成了又震了我
+      一下。取消抢屏震动吧」）：**抢屏这套流程默认不再震动**。
+      震动是 2026-10-09 为「让他知道抢到什么时候结束」加的，但他现在觉得这动静
+      比信息量更烦人 —— **提示本身全都保留**（浮窗 + 抢屏横幅通知），只是不震。
+      四个调用点（抢前预告 / 发完归还 / 发图预告 / 切群归还）共用这一个出口，
+      所以开关放这儿，一处生效、想开回来也只改一处：
+      启动桥接时设 `WX_GRAB_BUZZ=1`（或把下面的默认值 "0" 改掉）。
     """
+    if os.environ.get("WX_GRAB_BUZZ", "0").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return False
     try:
         exe = shutil.which("hud") or "/usr/local/bin/hud"
         subprocess.Popen([exe, "--buzz"], stdout=subprocess.DEVNULL,
@@ -1323,6 +1358,9 @@ def _hud_alarm(text, detail=""):
     会连震三下**，而且一直挂到 `_hud_alarm_off()` 才撤（抢完才收）。
 
     异步起、绝不 wait、异常一律吞掉 —— 提示失败绝不能影响发消息。
+
+    ⚠️ ★ 2026-10-14：**桥接侧已不再调用本函数**（借屏只走浮窗了，见 `_hud_grab_start`
+    / `_hud_released`）。hud App 的 `/alarm` 接口本身保留，人工仍可 `hud --alarm` 用。
     """
     try:
         exe = shutil.which("hud") or "/usr/local/bin/hud"
@@ -1336,7 +1374,11 @@ def _hud_alarm(text, detail=""):
 
 
 def _hud_alarm_off():
-    """撤掉那条抢屏提醒（抢完调 —— 有头有尾，别让它一直挂在他通知栏里）。"""
+    """撤掉那条抢屏提醒（抢完调 —— 有头有尾，别让它一直挂在他通知栏里）。
+
+    ★ 2026-10-14：桥接侧**已不再调用**（借屏提示统一走浮窗，见下面 `_hud_released`）。
+      函数保留是为了回滚方便，别删。
+    """
     try:
         exe = shutil.which("hud") or "/usr/local/bin/hud"
         subprocess.Popen([exe, "--alarmoff"], stdout=subprocess.DEVNULL,
@@ -1344,6 +1386,42 @@ def _hud_alarm_off():
         return True
     except Exception:
         return False
+
+
+# ------------------------------------------------------ 借屏提示：统一成两个出口
+# ★ 2026-10-14（用户要求，原话「微信机器人借屏好像也有两种通知方式，其中一种是
+#   键盘已经还给我了……不能统一一下吗？还是说这是两种路径？」）：
+#   借屏这套提示原来散在 6 处、4 个标题、2 条渠道（浮窗 + 通知栏横幅），
+#   光「我还给你了」就有「抢屏结束 / 借屏结束 / 输入法已还回」三种说法 ——
+#   用户会以为那是三件不同的事。
+#   现在收敛成**两个出口，全部只走浮窗**（标题正文固定，只有细节行按原因变）：
+#     · `_hud_grab_start()` —— **开始**：预告和「正在借」共用同一个标题，
+#       浮窗本来就是原地更新内容，所以视觉上始终是**同一条**；
+#     · `_hud_released()`    —— **结束**：发完消息 / 切完群 / 补还输入法三个调用点共用。
+#   ⚠️ **通知栏那一路（`_hud_alarm` / `hud --alarm`）桥接侧已不再调用** ——
+#   hud App 的 `/alarm` 接口本身保留（人工仍然可以 `hud --alarm` 手动发一条），
+#   想恢复「抢屏开始弹横幅」见 `_hud_alarm` 的说明。
+GRAB_TITLE = "🔒 微信机器人 · 借一下屏"
+RELEASED_TITLE = "✅ 借屏结束 · 可以拿手机了"
+
+
+def _hud_grab_start(text, detail=None, seconds=8):
+    """借屏**开始**的唯一出口（预告 / 真正动手两次调用都是它）。"""
+    return _hud_notice(text, seconds=seconds, title=GRAB_TITLE, detail=detail)
+
+
+def _hud_released(reason="发消息", detail=None):
+    """借屏**结束**的唯一出口 —— 标题正文固定，只有细节行按原因不同。
+
+    ``reason`` 只用来拼默认的细节行（如「发消息」「切群」）；要更具体的说明
+    就直接传 ``detail``。收尾顺带 `_hud_buzz()`（★ 默认已关，见那边的说明）。
+    """
+    try:
+        _hud_notice("键盘已经还给你了", seconds=6, title=RELEASED_TITLE,
+                    detail=detail or ("刚才是机器人%s临时借了一下" % reason))
+    except Exception:
+        pass
+    _hud_buzz()
 
 
 # ★ 2026-10-12：失败类弹窗合并。同一个原因在 FAIL_POPUP_DEDUP 秒内只弹一次。
@@ -1407,6 +1485,10 @@ def notify_user(text, title="DSH 微信机器人", force=False):
     节流 60 秒：群里连着几条消息只提醒一次。任何异常都吞掉，绝不影响发送流程。
     ``force=True`` 绕过节流 —— 2026-10-06 用户要求「要发消息时我在占用，弹我一下」，
     这个是"马上要抢你屏了"的预告，不能因为 60 秒节流被吞掉。
+
+    ⚠️ ★ 2026-10-14：**桥接侧已无调用点**（原来的两处抢屏/发图预告都改成
+    `_hud_grab_start()` 了）。留着是为了回滚方便，别再往里加新调用 ——
+    借屏提示请统一走 `_hud_grab_start()` / `_hud_released()`。
     """
     global _NOTIFY_LAST
     if not NOTIFY_ON:
@@ -1423,8 +1505,13 @@ def notify_user(text, title="DSH 微信机器人", force=False):
         #   非抢屏的普通提醒（force=False）仍旧走 shell —— 它本来就只是"顺嘴提一句"，
         #   不值得每 60 秒弹一条横幅打断他（那条静默通知他看不到也无所谓）。
         if force:
-            if ALARM_ON:
-                _hud_alarm(m)
+            # ★ 2026-10-14（用户要求「借屏只留浮窗」）：这里**不再发通知栏横幅** ——
+            #   原来 ALARM_ON 开着会调 `_hud_alarm(m)`（高优先级、会弹横幅）。
+            #   抢屏预告现在统一走 `_hud_grab_start()`（只浮窗）。想恢复：
+            #   把下面这行放开 + 起桥接时带 `WXBRIDGE_ALARM=1`。
+            # if ALARM_ON:
+            #     _hud_alarm(m)
+            pass
         else:
             adb("shell cmd notification post -S bigtext -t '%s' dshbot '%s'" % (t, m), 15)
         print("[wxbridge] 已弹让位提醒：%s" % m, flush=True)
@@ -1677,7 +1764,8 @@ def ensure_wechat_front(wait=1.6):
 
     已经在前台就直接返回 —— 省掉 1.6 秒 sleep 和一次 am start。
     **用户正在物理屏用微信时绝对不拉**（见 physical_wechat_in_use 的说明）；
-    用户**刚把微信切走**也先缓 ``RECLAIM_IDLE`` 秒（2026-10-04 用户要求 10 秒）——
+    用户**刚把微信切走**也先缓 ``RECLAIM_IDLE`` 秒（2026-10-04 要求 10 秒，
+    ★ 2026-10-14 用户改口要 5 秒）——
     否则他切出去看一眼别的 App 再切回来，微信已经被机器人抢没了。
     （这里读屏/发送都会调，所以这道缓冲等于「谁来都别急着抢」。）
     """
@@ -1883,7 +1971,11 @@ _PF_WHY = [""]            # 上一次 preflight_yield 放弃的原因（给 send
 
 
 def announce_grab(grace=None):
-    """弹「要借一下屏」的预告：系统通知 + 浮窗 + 震动。8 秒内只弹一次。"""
+    """弹「要借一下屏」的预告。8 秒内只弹一次。
+
+    ★ 2026-10-14：改走统一出口 `_hud_grab_start()` —— **只浮窗，不再发通知栏横幅**
+      （原先是 `notify_user(force=True)`，ALARM_ON 开着时还会多发一条高优先级通知）。
+    """
     grace = GRAB_GRACE if grace is None else float(grace)
     now = time.time()
     if now - _ANNOUNCE_LAST[0] < ANNOUNCE_GAP:
@@ -1892,9 +1984,10 @@ def announce_grab(grace=None):
     print("[wxbridge] 物理屏占着输入焦点 → 先弹预告，%.0f 秒后你不动才抢"
           % grace, flush=True)
     try:
-        notify_user("要借一下屏发消息：约 %.0f 秒后界面会切到后台，发完自动切回来。"
-                    "不想被打断就收一下键盘 / 点一下空白 / 切走" % grace,
-                    title="微信机器人 · 要借屏了", force=True)
+        _hud_grab_start("要借一下屏发消息：约 %.0f 秒后界面会切到后台，发完自动切回来。"
+                        "不想被打断就收一下键盘 / 点一下空白 / 切走" % grace,
+                        detail="你不动它就自己抢一下屏（界面会切后台，发完切回来）",
+                        seconds=int(max(6, grace + 2)))
     except Exception as exc:
         print("[wxbridge] 预告没发出去：%r" % (exc,), flush=True)
     _hud_buzz()          # 通知是静默渠道、浮窗可能没在看 —— 震一下最实在
@@ -1997,9 +2090,8 @@ def preflight_yield(force=False):
     #      它现在没有调用方了，保留定义只为少动一处）。
     prev = release_physical_input()
     if prev:
-        _hud_notice("正在借你的屏发消息…（发完自动切回来）", seconds=12,
-                    title="⏳ 机器人正在用键盘",
-                    detail="界面会先切到后台，几秒就好")
+        _hud_grab_start("正在借你的屏发消息…（发完自动切回来）", seconds=12,
+                        detail="界面会先切到后台，几秒就好")
     return True, prev
 
 
@@ -2032,7 +2124,7 @@ def _bottom_tab_green(img):
         · `/where` 报 chat_title 空、`_already_in_chat` 判"不在群里"→ 反复切群。
       实测（2026-10-10，full 档）：老窗口在聊天页有 1941~25055 个绿像素（全误判）。
     现在的判据 = **只取底部最左那一小块**（tab 图标本身），按比例：
-      实测 目标群群聊天页 0 / 文件传输助手聊天页 0 / 会话列表 4407。
+      实测 目标群聊天页 0 / 文件传输助手聊天页 0 / 会话列表 4407。
       ⚠️ y 起点必须 ≥0.925：0.90 时聊天页底部那条绿色群工具条会被算进来（3250），
          0.92 时文件传输助手页还有 353 —— 都会误判。
     """
@@ -2322,6 +2414,135 @@ def _wx_task_display(tid):
     return None
 
 
+# ══════════════ 虚拟屏画面冻结：检测 + 自愈（★ 2026-10-14） ══════════════
+# 病根（已坐实）：用户把微信拿到物理屏、切走后 `reclaim()` 用 `move-stack` 把它移回
+#   虚拟屏 —— 但**虚拟屏的 surface 不会重新合成**，画面永远停在"移走前的最后一帧"。
+#   后果是**静默失效**：机器人能读到画面、不报错、面板不挂红字，却永远读到同一张
+#   旧图（2026-10-14 实测失效近 1 小时；用户只能从"机器人不回消息"察觉）。
+# 检测 `_note_frame()`：`snapshot()` 本来就为省一次 OCR 算了截图 md5（实测静止的
+#   虚拟屏连抓三张 JPEG 逐位一致），直接拿来用。「连续 FREEZE_ROUNDS 轮 md5 完全
+#   相同」**且**「FREEZE_MOVE_WINDOW 秒内发生过跨屏移动」两条同时成立才怀疑 ——
+#   第二条把"群里本来就安静"挡掉大半。
+# 自愈 `_thaw_screen()`（独立线程，不阻塞读屏）：
+#   ① 唤醒 = 用 `am start --display <d>` 重放一次微信窗口，然后**再抓一帧**比对：
+#      变了 → 其实没冻（只是没新内容），收工；没变 → 真冻。
+#   ② 真冻时**只报警、不自动重建** —— 重建要杀掉虚拟屏上的微信任务，还要处理屏号
+#      缓存、重新放微信、切回群，链条长且当时无法在线验证安全性，所以留人工：
+#      日志写 WARNING + 浮窗挂出来，命令写在提示里（`SKILL.md` 也有）。
+#   ⚠️ 唤醒用的 `am start LauncherUI` 会把微信**提到会话列表** —— 这在
+#      `_move_wx_task_to_display` 里是禁忌（会把用户的聊天页顶掉），但**冻结时
+#      无所谓**：反正已经瞎着，且这条路径只在"确认冻结"之后才走。
+_FREEZE = {"md5": "", "same": 0, "moved_at": 0.0, "last_try": 0.0, "busy": False}
+FREEZE_ROUNDS = int(os.environ.get("WXBRIDGE_FREEZE_ROUNDS", "20"))
+FREEZE_MOVE_WINDOW = float(os.environ.get("WXBRIDGE_FREEZE_MOVE_WINDOW", "900"))
+FREEZE_COOLDOWN = float(os.environ.get("WXBRIDGE_FREEZE_COOLDOWN", "600"))
+# ★ 2026-10-16：复核时观察守护帧计数的秒数。实测虚拟屏**内容不变时本来就不产新帧**，
+#   所以这个窗口只能当"还要不要继续复核"的信号，不能单独当冻结证据（见 _thaw_screen）。
+FREEZE_PROBE_SECS = float(os.environ.get("WXBRIDGE_FREEZE_PROBE", "5"))
+
+
+def _note_frame(md5):
+    """读屏每帧报一次：连续多少轮画面一模一样；够格就叫一次自愈。"""
+    if not md5:
+        return
+    now = time.time()
+    if md5 == _FREEZE["md5"]:
+        _FREEZE["same"] += 1
+    else:
+        _FREEZE["md5"] = md5
+        _FREEZE["same"] = 0
+        return
+    if _FREEZE["busy"] or _FREEZE["same"] < FREEZE_ROUNDS:
+        return
+    if now - _FREEZE["moved_at"] > FREEZE_MOVE_WINDOW:
+        return                      # 很久没跨屏移动过 —— 多半只是群里安静
+    if now - _FREEZE["last_try"] < FREEZE_COOLDOWN:
+        return
+    _FREEZE["last_try"] = now
+    _FREEZE["busy"] = True
+    threading.Thread(target=_thaw_screen, daemon=True).start()
+
+
+def _thaw_screen():
+    """疑似冻结 → 先用**守护帧计数**复核死活，真冻才唤醒复验 + 报警。
+
+    ★ 2026-10-16（用户报「自动唤醒没成功，但是下一条也能发出去」）：
+      「连续 N 轮截图 md5 完全相同」**根本不能证明冻结** —— 群里安静时静止画面
+      的 JPEG 编码是逐位确定的，20 轮（约 1~2 分钟没人说话）必然相同，而
+      `FREEZE_MOVE_WINDOW=900` 秒那个附加条件几乎总成立。实测 08:28 / 08:51
+      两次报警都是误报：报警后连探 15 次 `/where` 全部读到「目标群」、消息照发。
+      更坏的是原来自愈一上来就 `am start LauncherUI` 重放窗口，**会把微信提到
+      会话列表**（有副作用），只是当时误判才没出事。
+      现在第一道判据换成守护的 `frames`：它在 ImageReader 回调里自增（每来一帧
+      +1，与客户端取不取图无关）—— **frames 在涨 = 屏还活着，画面静止只是群里
+      没新内容**；frames 停着不动才是真的不出帧。只有后者才继续唤醒复验。
+    """
+    try:
+        print("[wxbridge] ⚠️ 读屏画面连续 %d 轮完全没变（且 %.0f 秒前跨屏移动过）"
+              "→ 疑似虚拟屏冻结，先复核屏的死活"
+              % (_FREEZE["same"], time.time() - _FREEZE["moved_at"]), flush=True)
+        _FREEZE["same"] = 0        # 本次复核已经接手，先复位，别让它每轮重复进来
+        # ★ 2026-10-16（第二轮修正）：**不再 `am start` 重放窗口**。两个原因：
+        #   ① 它根本改不动画面 —— 微信 task 已经在同一块 display 上，`am start`
+        #      LauncherUI 到同一个 display 等于 no-op，所以"唤醒后画面纹丝不动"
+        #      是必然的，**这一点从来不能证明冻结**（08:51 那次就是这么误报的）；
+        #   ② 万一它真生效，会把微信**提到会话列表**（顶掉聊天页）—— 误报时纯属添乱。
+        #   现在改成两步纯只读的复核：
+        #   ① 守护出帧计数在 `_FREEZE_PROBE_SECS` 秒内涨过 → 屏活着，收工
+        #      （注：Android 虚拟屏**内容不变时本来就不产新帧**，所以"不涨"仍不足为证，
+        #       只是把它当"继续复核"的信号）；
+        #   ② 画面静止但**标题照样读得出来** → 只是群里没有新内容，收工；
+        #   ③ 帧不涨 **且** 连读两帧连标题都读不出 → 才算读屏真的瞎了，提示用户。
+        _f1 = _vsd_frames()
+        if _f1 is not None:
+            time.sleep(FREEZE_PROBE_SECS)
+            _f2 = _vsd_frames()
+            if _f2 is not None and _f2 > _f1:
+                print("[wxbridge] 自愈① 守护仍在出帧（frames %d→%d）→ 屏没冻，"
+                      "只是画面没新内容（群里安静），收工" % (_f1, _f2), flush=True)
+                return
+            print("[wxbridge] 冻结复核：帧计数停着（%s→%s）→ 再看读屏还读不读得到东西"
+                  % (_f1, _f2), flush=True)
+        else:
+            print("[wxbridge] 冻结复核：读不到守护帧计数 → 再看读屏还读不读得到东西",
+                  flush=True)
+        for _i in range(2):
+            _d2 = {}
+            _t2, _ = _title_probe("/tmp/wxbridge-freeze-probe.jpg", _d2)
+            if _t2:
+                print("[wxbridge] 自愈① 画面静止但标题仍读得到（%r）→ 判为"
+                      "「本来就没新内容」，不是冻结，收工" % _t2, flush=True)
+                return
+            if _i == 0:
+                time.sleep(1.0)
+        # ★ 2026-10-16（用户拍板「扰动复验加上」）：到这一步仍然只是"怀疑" ——
+        #   静止的画面 + 读不出的标题，也可能是抓帧那一瞬的偶发失败。**唯一能定案的
+        #   是主动扰动**：把微信 task 搬到另一块虚拟屏再搬回，这一步必然触发重绘。
+        #   · 画面/帧动了 → 屏活着，收工（不打扰用户）；
+        #   · 纹丝不动     → 真冻结，才报「需要重建」；
+        #   · 做不了（只有一块屏 / 拿不到 task id）→ 按"疑似"保守提示（不谎报已确认）。
+        _dv = _disturb_and_verify()
+        if _dv is True:
+            print("[wxbridge] 自愈② 扰动后画面已更新 → 屏活着（刚才只是没新内容），"
+                  "收工", flush=True)
+            return
+        if _dv is None:
+            print("[wxbridge] 自愈② 扰动做不了（只有一块屏 / 拿不到微信 task）"
+                  "→ 只能按「疑似」提示", flush=True)
+        else:
+            print("[wxbridge] ⚠️⚠️ 自愈② 扰动后画面纹丝不动 → **虚拟屏已冻结**："
+                  "先 bash /sdcard/dsh/wechat-bot/app/wxbridge_ctl.sh restart；"
+                  "仍不行重建虚拟屏 sh /sdcard/dsh/vscreen-daemon/start.sh 18250"
+                  " 再 bash bot.sh start --restart", flush=True)
+        _hud_notice("读屏画面长时间没变化、内容也读不出来",
+                    seconds=20, title="⚠️ 微信机器人 · 可能看不见新消息",
+                    detail="先重启桥接；仍不行再重建虚拟屏（命令见日志/SKILL.md）")
+    except Exception as exc:
+        print("[wxbridge] 自愈异常：%r" % (exc,), flush=True)
+    finally:
+        _FREEZE["busy"] = False
+
+
 def _move_wx_task_to_display(did):
     """把微信 task **整体**搬到 did 屏，保留 Activity 栈。返回 task 是否存在。
 
@@ -2337,6 +2558,9 @@ def _move_wx_task_to_display(did):
     if _wx_task_display(tid) == did:
         return True
     adb("cmd activity display move-stack %d %d" % (tid, did), 25)
+    # ★ 2026-10-14：记下"刚跨屏移动过" —— 画面冻结**只在这之后发生**，
+    #   `_note_frame()` 拿它当判据之一（把"群里本来就安静、画面几十分钟没变"挡掉）。
+    _FREEZE["moved_at"] = time.time()
     return True
 
 
@@ -2566,7 +2790,7 @@ def find_send_btn(img=None):
 _SEND_RETRYABLE = [False]
 
 
-def send_text(text, input_retries=3, force=False):
+def send_text(text, input_retries=4, force=False):
     """往当前会话发一句话（对外入口）。实现见 ``_send_text_inner``。
 
     ★ 2026-10-09 用户要求「浮窗要有头有尾」：原来"输入框内容对不上""字没进去"
@@ -2582,7 +2806,7 @@ def send_text(text, input_retries=3, force=False):
     return ok, why
 
 
-def _send_text_inner(text, input_retries=3, force=False):
+def _send_text_inner(text, input_retries=4, force=False):
     """发一句话到当前会话 —— **只点一次「发送」，绝不重复发**。
 
     ⚠️ 2026-10-03 血泪（群里连出三个「？」就是这个函数干的）：
@@ -2652,6 +2876,8 @@ def _send_text_inner(text, input_retries=3, force=False):
     saved = current_ime()
     _released_phys = _pre_prev        # preflight 里真抢过的话，交给 finally 切回来
     _rebuilt_ime = False
+    # ★ 2026-10-14：输入连接重建只做一次（见下面"没聚焦"分支）
+    _ime_reswitched = False
     # ★ 2026-10-09（用户拍板「全改」）：抢也**只抢一次** —— 抢过还拿不到焦点就该
     #   认输（这一条留给下一轮），而不是像原来那样掉进"等你让位"分支白等 30 秒。
     _grab_tried = bool(_pre_prev)
@@ -2665,46 +2891,42 @@ def _send_text_inner(text, input_retries=3, force=False):
         #     ① 读到别的会话名        → 拒发（原行为，保留）
         #     ② 读不出 / 读残         → **先主动切回目标群，再核对一次**
         #     ③ 切回后仍读不出        → 拒发（宁可漏这一条，也不能发错群）
+        # ★ 2026-10-16（用户报「前一条发出去了，后一条就不确定是不是在目标群」）：
+        #   ①②③ 的**判据从"读一帧"改成"连读 N 帧投票"**（见 `_title_vote`）——
+        #   现场铁证是同一秒里 `/send` 读不出、而它自己调用的 `open_chat` 却判定
+        #   "已经在目标会话"，说明读空是随机的瞬时故障。任一帧读到目标群即放行；
+        #   读到别的会话立刻拒发；全读不出才走切群那一步。安全边界没变
+        #   （仍要求至少一帧铁证看着是目标群）。
         _want = _default_chat()
         if _want and wxreader is not None:
-            _where = "/tmp/wxbridge-where.jpg"
-
-            def _title_now():
-                """当前会话标题（读不出返回 ""）。
-
-                ★ 2026-10-10：判据从 `on_chat_page()` 换成 `_chat_title_now` ——
-                  "列表里直接点"进群时 activity 还是 LauncherUI，老判据会一直
-                  读不出 → 每次发送都先"切回目标群"再拒发（列表点这条路等于白走）。
-                """
-                if not shot_wechat(_where):
-                    return ""
-                return _chat_title_now(_where)
-
             try:
-                _cur = _title_now()
-                _clean = _cur.replace("…", ".").strip(". ")
-                if len(_clean) >= 2 and not wxreader.match_title(_cur, _want):
-                    print("[wxbridge] /send 当前会话「%s」≠ 目标「%s」→ 这条不发"
-                          % (_cur, _want), flush=True)
+                _ok, _cur, _notes = _title_vote(_want, keep=True)
+                if _ok is False:
+                    print("[wxbridge] /send 当前会话「%s」≠ 目标「%s」→ 这条不发（%s）"
+                          % (_cur, _want, "；".join(_notes)), flush=True)
                     return False, "当前不在目标会话（读到 %r），这条没发" % _cur
-                if len(_clean) < 2:
-                    # ② 读不出/读残 → 先切回目标群（open_chat 内部有它自己的严判据）
-                    print("[wxbridge] /send 标题读不出（%r）→ 先切回目标群再核对"
-                          % _cur, flush=True)
+                if _ok is None:
+                    # ② 连读 N 帧都读不出/读残 → 先切回目标群（open_chat 有自己的严判据）
+                    print("[wxbridge] /send 连读 %d 帧都没读到标题（%s）"
+                          "→ 先切回目标群再核对"
+                          % (_TITLE_VOTE_FRAMES, "；".join(_notes) or "无"), flush=True)
                     _back = False
                     try:
                         _back = bool(open_chat(_want, verify=True))
                     except Exception as exc:
                         print("[wxbridge] /send 切回目标群异常：%r" % (exc,), flush=True)
-                    _cur2 = _title_now() if _back else ""
-                    _clean2 = _cur2.replace("…", ".").strip(". ")
-                    if len(_clean2) >= 2 and wxreader.match_title(_cur2, _want):
+                    if not _back:
+                        _ok2, _cur2, _notes2 = None, "", []
+                    else:
+                        _ok2, _cur2, _notes2 = _title_vote(_want, keep=True)
+                    if _ok2 is True:
                         print("[wxbridge] /send 已切回目标群「%s」，继续发送" % _cur2,
                               flush=True)
                     else:
                         # ③ 切了也认不出来 —— 拒发（不可逆的错发比漏发严重得多）
-                        print("[wxbridge] /send 切回后仍无法确认会话（%r，切群=%s）"
-                              "→ 这条不发" % (_cur2, _back), flush=True)
+                        print("[wxbridge] /send 切回后仍无法确认会话（%r，切群=%s；%s）"
+                              "→ 这条不发"
+                              % (_cur2, _back, "；".join(_notes2) or "无"), flush=True)
                         return False, "无法确认当前会话是不是目标群，这条没发"
             except Exception as exc:
                 # 校验本身出错也不再"忽略继续发"：这是发送前的最后一道闸门
@@ -2774,7 +2996,15 @@ def _send_text_inner(text, input_retries=3, force=False):
             #   下结论 → 连着三次换坐标重点、整条作废。日志里这种
             #   「点完输入框还没聚焦」已经攒了 25 条（11:59 那次就是图发出去了、
             #   配文没跟上）。
-            if not _wait_input_focus(3.0):
+            if not _wait_input_focus(4.5):
+                # ★ 2026-10-14（排查「字没能进到输入框」，3 天 15 次）：3.0 秒是
+                #   **贴着实测下限**定的（下面那段注释说"要 2 秒上下"）—— 慢一点就
+                #   三次全超时、整条放弃，日志里连着三行「点完输入框还没聚焦」。
+                #   实证（10-14 17:33）：那一轮 3 次全灭，紧接着补发时**第 1 次也没**
+                #   聚焦、第 2 次才成 —— 说明只是"需要多给一次机会/多等一会儿"，
+                #   不是真的不可用。所以：等待 3.0 → **4.5 秒**、重试 3 → **4 次**。
+                #   ⚠️ 代价只在**真的没聚焦**时才付（聚焦了第一次查就返回，约 0.3s），
+                #   最坏 4×4.5≈18 秒，远小于 /send 的 180 秒超时（见 android.py）。
                 # 2026-10-05：**两样折腾都不要做，直接换坐标重点**（都默认关，见文件顶部）：
                 #   · 物理屏占着输入焦点 → 不 HOME、不 am start（会把 DSH 弄黑屏）；
                 #   · 输入框点不进去 → 不 disable/enable DshIme（那是 DSH 自己的输入法，
@@ -2796,6 +3026,30 @@ def _send_text_inner(text, input_retries=3, force=False):
                                        "「抢一下再发」）")
                     if _prev2:
                         _released_phys = _prev2
+                # ★ 2026-10-14（用户报「字没能进到输入框」的冷启动场景）：重试前
+                #   **切走再切回输入法** = 重建 IME 连接。实证 21:50 —— 微信刚冷启动
+                #   时 4 次按坐标重点**全失败**，而紧接着挂补发的那一轮第 1 次就成了：
+                #   两轮唯一的差别，就是"新一轮开头重新切过一次输入法"。
+                #   ⚠️ 两条不能走的路：① `rebuild_ime()` 是 disable/enable，会让
+                #   **DSH 白屏**（2026-10-05 的坑，见它的说明）；② 再 `ime_set(IME_OURS)`
+                #   一次没用 —— `ime_set` 见当前已经是它就直接 return（白做）。
+                #   ⚠️ 只在**没聚焦**时做才安全：此刻输入框本来就没攥着焦点，切输入法
+                #   不会把它"弄失焦"（那条禁忌针对的是 tap 之后别再碰输入法）。
+                if not _ime_reswitched:
+                    _ime_reswitched = True
+                    # ★ 2026-10-15 修正（用户报「发着发着定位不到输入框，然后连续四次
+                    #   一下屏」）—— ⚠️ **绝不能"切回用户的输入法"**：切回讯飞会让它把
+                    #   键盘弹到**物理屏**，而物理屏前台常常正是 DSH，于是系统判定
+                    #   「物理屏占着输入焦点」→ 机器人**去抢屏（按 HOME 把 DSH 踢回
+                    #   桌面）+ 补一个 BACK** → 用户屏幕上连闪。
+                    #   实测 2026-10-15 00:01~00:12，每一次失败重试都触发一遍，日志：
+                    #     重建输入连接（切走 → 切回输入法）→ 输入法 DshIme → FlyIME
+                    #     → 物理屏占着输入焦点（com.dshmobile.probe）→ 按 HOME → 补 BACK
+                    #   改成**直接重发一次 `ime set`**（绕过 ime_set 的幂等短路）：
+                    #   不换输入法、不弹键盘，只是让系统重建一次输入连接。
+                    print("[wxbridge] /send 重建输入连接（重新 ime set 一次）…", flush=True)
+                    adb("ime set %s" % IME_OURS, 20)
+                    time.sleep(0.4)
                 if REBUILD_IME and not _rebuilt_ime:
                     _rebuilt_ime = True
                     rebuild_ime()
@@ -2900,15 +3154,13 @@ def _send_text_inner(text, input_retries=3, force=False):
             _tk("发送后自检（含 1.7s 等待）")
         restore_physical_app(_released_phys)
         # ★ 2026-10-09 用户要求（原话「我不知道抢到什么时候才结束」）：抢屏必须
-        #   **有头有尾** —— 预告在 notify_user(force=True)，这里补**结束信号**：
+        #   **有头有尾** —— 预告在 `_hud_grab_start()`，这里补**结束信号**：
         #   恢复前台之后再浮一条 + 震一下，他才知道可以拿回手机了。
         #   只有他本来真的占着键盘（抢过）时才说，没抢就不打扰。
         if _released_phys:
-            _hud_alarm_off()   # ★ 2026-10-10：撤掉那条抢屏提醒（有头有尾）
-            _hud_notice("键盘已经还给你了", seconds=6,
-                        title="✅ 抢屏结束 · 可以拿手机了",
-                        detail="刚才是机器人发消息临时借了一下")
-            _hud_buzz()
+            # ★ 2026-10-14：统一走 `_hud_released()`（只浮窗、文案固定）。
+            #   原来还先调 `_hud_alarm_off()` 撤通知栏那条 —— 桥接已不再发它了。
+            _hud_released("发消息")
         ime_set(saved)
 
 
@@ -2940,7 +3192,7 @@ def _share_row_match(t, target):
     一次发图白跑 50 秒。
 
     列表行的身份证据必须是**汉字**：微信在这一页截断时也会留下头部/尾部的连续
-    汉字（实测「人间... (111人)」），所以要求「与目标共享一段连续 ≥2 个汉字」。
+    汉字（实测「示例... (111人)」），所以要求「与目标共享一段连续 ≥2 个汉字」。
     纯数字/符号行（「158, 89...」「a妈1922...」）一律不认。
     """
     s = _norm(t).replace("…", "...")
@@ -2960,10 +3212,10 @@ def _share_hit_strength(t, target):
 
     ★ 2026-10-09 加。为什么要按"最长连续汉字"分级，而不是看它是不是完整含
     目标名前 4 个字：本机 OCR（v5 server）把横排里的群名读成**两块** ——
-    「人间缺」+「德享乐..」，谁都不含完整的「目标群」。但这两块各自与目标名
-    对得上 3 个连续汉字，合起来就是"目标群名"，证据其实很硬；
-    而反例（列表里那个数字群「158, 89...」、或别的群「人间疾苦」）最多只对得上
-    2 个连续汉字（"人间"），差一档。
+    「示例群」+「名字..」，谁都不含完整的「示例群名」。但这两块各自与目标名
+    对得上 3 个连续汉字，合起来就是"示例群名"，证据其实很硬；
+    而反例（列表里那个数字群「158, 89...」、或别的群「示例疾苦」）最多只对得上
+    2 个连续汉字（"示例"），差一档。
     """
     s = _norm(t).replace("…", "...")
     n = _norm(target)
@@ -2985,19 +3237,19 @@ def _share_find_row(img, target):
     **(列表行, 横排行, 列表命中强度, 横排命中强度)**（两个行都可以是 None）。
 
     命中强度（★ 2026-10-09 加，给预览页校验当依据）：
-      · ``"exact"`` —— 与目标名对得上 **≥3 个连续汉字**（`人间缺` / `德享乐`），硬证据；
-      · ``"loose"`` —— 只对得上 2 个汉字（`人间`），弱证据；
+      · ``"exact"`` —— 与目标名对得上 **≥3 个连续汉字**（`示例群` / `名字`），硬证据；
+      · ``"loose"`` —— 只对得上 2 个汉字（`示例`），弱证据；
       · ``""`` —— 没命中。
 
     实测的坑：
-      · OCR 会把群名拆块（`「目标群` + `享乐实录」(112人)`）→ 取目标名前 4 个字
+      · OCR 会把群名拆块（`「示例群名` + `享乐实录」(112人)`）→ 取目标名前 4 个字
         当特征串，谁包含它就算谁；
       · 列表**上方**还有一排「最近转发」横排，同样的名字会再出现一次 ——
         所以要先定位「最近聊天」标题，优先在它下面找（否则找「文件传输助手」
         会命中横排里的「助手」）。
       · ⭐ 2026-10-04 补：但**不能把横排整个抛弃**。实测目标群不在「最近聊天」
         首屏时（列表里只有 6 个最近会话），横排里却明明白白露着它的名字
-        （`「人间缺` / `德享乐...`），老代码跳过横排 → 翻页翻到底也找不到 → 发图
+        （`「示例群` / `名字...`），老代码跳过横排 → 翻页翻到底也找不到 → 发图
         直接放弃。实测点击横排项**一样会进预览页**（activity =
         HalfScreenTransparentActivity），后面那层「发送给：」校验照样能拦住误选，
         所以把横排命中当**次选**返回是安全的。
@@ -3015,15 +3267,15 @@ def _share_find_row(img, target):
     best_why = horiz_why = ""
     for t, cx, cy in words:
         # 精确特征串之外再挂一道行匹配兜底：这一页的群名同样会被系统截断成
-        # 「人间... (111人)」（2026-10-03 的失败截图就是这个形态），
-        # 拿「目标群」四个字去比是永远比不上。
+        # 「示例... (111人)」（2026-10-03 的失败截图就是这个形态），
+        # 拿「示例群名」四个字去比是永远比不上。
         # ⚠️ 这里**不能**直接用 wxreader.match_title：它对「无汉字 + 有省略号」的行
         #    会放行，2026-10-04 就这么误选中了列表里的「158, 89...」。
         if key in _norm(t):
             why = "exact"
         elif _share_row_match(t, target):
             # ⚠️ 不能一律记成 "loose"：`_share_row_match` 只要求 2 个连续汉字，
-            #   而实测横排会读成「人间缺」这种 3 字块 —— 那已经够硬了（见
+            #   而实测横排会读成「示例群」这种 3 字块 —— 那已经够硬了（见
             #   `_share_hit_strength` 的说明）。
             why = "exact" if _share_hit_strength(t, target) >= 3 else "loose"
         else:
@@ -3154,17 +3406,34 @@ def _default_chat():
     只用来给 `abandon_share` 当第二兜底：发图失败、目标会话又切不回去时，
     至少把界面送回机器人认得的群，避免它永久「待命中」。读不到就返回空串。
     """
-    cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+    # ⚠️ 2026-10-13：v2.0.0 把用户数据搬到了 ../data/，这里原来写死
+    #    `本文件目录/config.yaml` → 每次调用都 FileNotFoundError、兜底**彻底失效**
+    #    （只在日志里刷一行错误）。后果不是"少个兜底"：发图一旦失败，界面会留在
+    #    「选择聊天」页切不回群，机器人此后每轮读到的标题都是它 → **永久待命、
+    #    什么消息都不回**（2026-10-03 踩过同款故障）。现在优先走
+    #    `wxauto.paths.DATA_DIR`，并保留 app/ 老布局的回落。
+    cands = []
     try:
-        with open(cfg, encoding="utf-8") as fh:
-            for line in fh:
-                s = line.split("#", 1)[0].strip()
-                if s.startswith("group:"):
-                    v = s.split(":", 1)[1].strip().strip('"').strip("'")
-                    if v:
-                        return v
-    except Exception as exc:
-        print("[wxbridge] 读 config.yaml 取目标群失败：%r" % (exc,), flush=True)
+        from wxauto.paths import DATA_DIR
+        cands.append(os.path.join(str(DATA_DIR), "config.yaml"))
+    except Exception:
+        pass
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"))
+    last_exc = None
+    for cfg in cands:
+        try:
+            with open(cfg, encoding="utf-8") as fh:
+                for line in fh:
+                    s = line.split("#", 1)[0].strip()
+                    if s.startswith("group:"):
+                        v = s.split(":", 1)[1].strip().strip('"').strip("'")
+                        if v:
+                            return v
+        except Exception as exc:
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        print("[wxbridge] 读 config.yaml 取目标群失败：%r" % (last_exc,), flush=True)
     return ""
 
 
@@ -3275,20 +3544,17 @@ def send_image(path, chat):
     if physical_ime_visible():
         if _pf_now - _IMG_ANNOUNCE_LAST[0] >= ANNOUNCE_GAP:
             _IMG_ANNOUNCE_LAST[0] = _pf_now
+            # ★ 2026-10-14：原来这里**发两条重复的浮窗**（`_hud_fail_notice` 一条 +
+            #   `notify_user` 一条，标题都是「要发图了」），还外加通知栏 —— 正是用户
+            #   说的「两种通知方式」。现在只走统一的 `_hud_grab_start()`。
             try:
-                _hud_fail_notice("要借一下屏发张图：%.0f 秒后就动手（不改你打的字）"
-                                 % IMG_HANG_SECONDS,
-                                 seconds=int(IMG_HANG_SECONDS) + 4,
-                                 title="微信机器人 · 要发图了",
-                                 detail="你可以先收一下键盘，让位更干净")
+                _hud_grab_start("要借一下屏发张图：%.0f 秒后就动手（不改你打的字）"
+                                % IMG_HANG_SECONDS,
+                                detail="你可以先收一下键盘，让位更干净",
+                                seconds=int(IMG_HANG_SECONDS) + 4)
             except Exception:
                 pass
-            try:
-                notify_user("要发一张图到群里：约 %.0f 秒后动手。" % IMG_HANG_SECONDS,
-                            title="微信机器人 · 要发图了", force=True)
-            except Exception:
-                pass
-            _hud_buzz()      # 通知是静默渠道、浮窗可能没在看 —— 震一下最实在
+            _hud_buzz()
         wait_user_idle(hang=IMG_HANG_SECONDS)
         if physical_ime_visible():
             print("[wxbridge] /send_image 你还在打字 —— 按用户口径（3 秒后直接抢）照做",
@@ -3346,7 +3612,7 @@ def send_image(path, chat):
             # ★ 2026-10-09：原来要等满 3 轮（attempt>=2）才肯用横排，实测那两轮**纯属白等** ——
             #   本机微信在「最近聊天」列表里把长群名压成「... （110人）」（一个特征汉字都不剩，
             #   `_share_row_match` 要求连续 ≥2 汉字，必然认不出来），而横排里
-            #   「人间缺 / 德享乐...」清清楚楚。改成第 2 轮就用横排，省 ~6 秒。
+            #   「示例群 / 名字...」清清楚楚。改成第 2 轮就用横排，省 ~6 秒。
             #   安全性不变：进预览页后照旧要过「发送给：」那道校验（见下面 _preview_*）。
             if horiz and attempt >= 1:
                 pos, hit_why = horiz, why_horiz
@@ -3550,7 +3816,7 @@ def _img_ahash(im):
     return "%016x" % bits
 
 
-def _crop_message_image(src, bbox, is_self, seq, idx):
+def _crop_message_image(src, bbox, is_self, seq, idx, prefix="f", prune=True):
     """把一条图片消息从当帧截图上裁下来，存成 JPEG。返回信息字典或 None。
 
     裁剪框过 ``wxreader.refine_image_box`` 精修 —— 检测到的气泡框常常只包住
@@ -3577,7 +3843,7 @@ def _crop_message_image(src, bbox, is_self, seq, idx):
         if max(crop.size) > IMG_CROP_MAX_EDGE:
             crop.thumbnail((IMG_CROP_MAX_EDGE, IMG_CROP_MAX_EDGE), Image.LANCZOS)
         os.makedirs(IMG_CROP_DIR, exist_ok=True)
-        path = os.path.join(IMG_CROP_DIR, "f%d-%d.jpg" % (seq, idx))
+        path = os.path.join(IMG_CROP_DIR, "%s%d-%d.jpg" % (prefix, seq, idx))
         q = IMG_CROP_QUALITY
         while q >= 55:
             crop.save(path, quality=q, optimize=True)
@@ -3587,7 +3853,8 @@ def _crop_message_image(src, bbox, is_self, seq, idx):
             except OSError:
                 break
             q -= 10
-        _prune_img_crops(seq)
+        if prune:
+            _prune_img_crops(seq)
         md5 = hashlib.md5(open(path, "rb").read()).hexdigest()[:12]
         ahash = _img_ahash(crop)                 # 抗 1px 抖动的指纹（见 _img_ahash）
         print("[wxbridge] 取到图片消息 #%d：框 %s → %s，%dx%d %d 字节"
@@ -3598,6 +3865,21 @@ def _crop_message_image(src, bbox, is_self, seq, idx):
     except Exception as exc:
         print("[wxbridge] 取图失败：%r" % (exc,), flush=True)
         return None
+
+
+def _clean_backfill_crops():
+    """清掉上一轮翻屏留下的 b* 裁剪图。
+
+    ★ 2026-10-15：翻屏找图（``/backfill?images=1``）的裁剪文件**故意不参与**
+      ``_prune_img_crops`` —— 那个函数是给"最新一帧"设计的（只留最近 3 帧），
+      翻屏的图会被它当场删掉，bot 拿到路径也读不到。代价是它们要自己清。
+    """
+    try:
+        for name in os.listdir(IMG_CROP_DIR):
+            if name.startswith("b"):
+                os.unlink(os.path.join(IMG_CROP_DIR, name))
+    except OSError:
+        pass
 
 
 def _prune_img_crops(seq):
@@ -3656,6 +3938,9 @@ def snapshot(full=False, images=False):
                 _md5 = hashlib.md5(_fh.read()).hexdigest()
         except OSError:
             _md5 = ""
+    # ★ 2026-10-14：虚拟屏画面冻结检测 —— 每帧报一次，**必须放在缓存命中 return
+    #   之前**（冻结时 md5 必然一直相同，缓存必然命中，放后面就永远轮不到）。
+    _note_frame(_md5)
     _key = (bool(full), bool(images), _md5)
     _c = _SNAP_CACHE
     if (_md5 and _c["key"] == _key and _c["out"] is not None
@@ -3822,11 +4107,16 @@ def _record_clean(rows, max_chars=4000):
 BACKFILL_MAX = 4
 
 
-def backfill(screens=2, chat=""):
+def backfill(screens=2, chat="", images=False):
     """手动补读：往上滚 N 屏读回历史消息，最后切回最新。
 
     返回 ``{"ok": bool, "frames": [[消息…], …], "error": str}``；
     每条消息形如 ``{"text":…, "sender":…, "is_self":…, "type":…}``。
+
+    ★ 2026-10-15（用户：「我要的是读张三的图片，需要翻屏幕」）：``images=True``
+      时把每屏的**图片消息也裁出来**（多带 img_path/img_w/img_h/img_md5/img_hash），
+      机器人被叫看图、而那张图已经被刷上去时，靠它把图捞回来。
+      裁剪文件用 ``b`` 前缀（不参与 ``_prune_img_crops``，见 ``_clean_backfill_crops``）。
     """
     _ensure_screen_known()
     d = _require_did()
@@ -3851,6 +4141,10 @@ def backfill(screens=2, chat=""):
     except Exception:
         W, H = 1272, 2800
 
+    bf_seq = int(time.time())
+    if images:
+        _clean_backfill_crops()      # 先清上一轮的（它们不会被自动清理）
+
     frames = []
     for i in range(n):
         # 「手指从上往下滑」才是看更早的消息（写反了会一直停在最新，见 SKILL.md）
@@ -3866,13 +4160,24 @@ def backfill(screens=2, chat=""):
             print("[wxbridge] 补读第%d屏解析失败：%r" % (i + 1, exc), flush=True)
             continue
         items = []
-        for m in (snap.get("messages") or []):
+        for mi, m in enumerate(snap.get("messages") or []):
             if m.get("type") in ("time", "system"):
                 continue
-            items.append({"text": m.get("text", ""),
-                          "sender": m.get("sender", ""),
-                          "is_self": bool(m.get("is_self")),
-                          "type": m.get("type", "text")})
+            item = {"text": m.get("text", ""),
+                    "sender": m.get("sender", ""),
+                    "is_self": bool(m.get("is_self")),
+                    "type": m.get("type", "text")}
+            # ★ 2026-10-15：被叫看图时把这一屏的图片一起裁回来（bot 侧要翻屏找某人的图）
+            if images and item["type"] == "image" and m.get("bbox"):
+                got = _crop_message_image(pth, m["bbox"], item["is_self"],
+                                          bf_seq, mi, prefix="b", prune=False)
+                if got:
+                    item["img_path"] = got["path"]
+                    item["img_w"] = got["w"]
+                    item["img_h"] = got["h"]
+                    item["img_md5"] = got["md5"]
+                    item["img_hash"] = got.get("hash", "")
+            items.append(item)
         frames.append(items)
         print("[wxbridge] 补读第%d屏：%d 条（标题 %r）"
               % (i + 1, len(items), snap.get("chat_title")), flush=True)
@@ -3955,6 +4260,324 @@ def read_record(match=""):
             "activity": act1, "after": act2}
 
 
+def _find_sender_block(rows, sender, height=0):
+    """在整屏 OCR 行里找「sender 发的那条消息」的可见文字块，返回 (y0,x0,x1,y1,label)。
+
+    ★ 2026-10-15（用户要求「顺手也认『聊天记录』以外的卡片」）：聊天记录卡片有固定
+      标题格式（「XX的聊天记录」，见 `_find_record_card`），转发图文 / 链接 / 公众号
+      卡片**没有** —— 只能按位置找：群里**昵称在消息上方**，所以"昵称行下面、到下一个
+      大空档之前的那些行"就是这条消息（卡片里的文字也会被 OCR 一起读出来），取并集矩形。
+
+    ⚠️ 三条保守约束：
+      · 只认**最靠下**的那条同名昵称行（屏幕上最新那条）；
+      · 行数上限 10、碰到 ≥220px 的行间大空档就停（别把下一条消息并进来）；
+      · 底部 10% 的 OCR 行（微信底部 tab 栏）一律不要 —— 否则并集会被拉到底部，
+        点中心就点到「通讯录 / 发现」上去了。
+    返回 None = 找不到（调用方就此收手，绝不乱点）。
+    """
+    s = (sender or "").strip()
+    if not s or not rows:
+        return None
+
+    def _clean(t):
+        return (t or "").strip().strip("：:")
+
+    idx = [i for i, r in enumerate(rows) if _clean(r[4]) == s]
+    if not idx:
+        # 昵称可能被 OCR 读残/断词（「张三」读成「素问 阿兰」）→ 退一步做包含匹配，
+        # 但要求"这一行基本就是这个昵称"（长出来的不超过 3 个字）。
+        idx = [i for i, r in enumerate(rows)
+               if s in _clean(r[4]) and len(_clean(r[4])) <= len(s) + 3]
+    if not idx:
+        return None
+    i = idx[-1]
+    name_y1 = rows[i][3]
+    lim = int(height * 0.90) if height else 10 ** 9
+    block = []
+    for r in rows[i + 1:]:
+        if r[3] <= name_y1:
+            continue
+        if r[3] > lim:
+            break
+        t = _clean(r[4])
+        if not t:
+            continue
+        if block and (r[0] - block[-1][3]) > 220:
+            break                      # 大空档 = 这条消息已经结束
+        block.append(r)
+        if len(block) >= 10:
+            break
+    if not block:
+        return None
+    y0 = min(r[0] for r in block)
+    y1 = max(r[3] for r in block)
+    x0 = min(r[1] for r in block)
+    x1 = max(r[2] for r in block)
+    if y1 - y0 < 20:                   # 太薄（多半只读到半行）→ 不敢点
+        return None
+    return (y0, x0, x1, y1, _clean(rows[i][4]))
+
+
+IMG_HASH_SAME_DIST = 12                   # aHash 判"同一张图"的距离阈值（与 state 同值）
+GALLERY_ACT = "gallery.ui.GalleryEntryUI"      # 微信图片查看器（点开一张图进这里）
+
+
+def _ham(a, b):
+    """两个 aHash 整数的汉明距离（判"是不是同一张图"）。"""
+    if a is None or b is None or a < 0 or b < 0:
+        return 999
+    return bin(int(a) ^ int(b)).count("1")
+
+
+def _dark_ratio(path):
+    """截图里"暗像素"的比例 —— 微信图片查看器是**黑底**，聊天页是白/灰底。
+
+    ★ 2026-10-15：判"点开后进没进看图页"**不能用 activity** —— 实测
+      `screen_activity()`（读 topResumedActivity）在 freeform 下一直报
+      `com.tencent.mm/.ui.LauncherUI`，哪怕画面已经是大图查看器（dumpsys 里
+      GalleryEntryUI 明明在）。第一次实测就因此误判"没点开"。
+      换成看画面本身：黑底 = 看图页。实测聊天页暗像素 < 5%，看图页 > 60%。
+    """
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L")
+        im.thumbnail((64, 64))
+        px = list(_pixels(im))
+        return sum(1 for v in px if v < 50) / float(len(px) or 1)
+    except Exception:
+        return -1.0
+
+
+def _shot_diff(a, b):
+    """两张截图的 aHash 汉明距离 —— 判"画面是不是换了一页"。
+
+    ★ 2026-10-15：判"点开后有没有进新页面"试过两条路都不行：
+      · `screen_activity()`（freeform 下恒报 LauncherUI，见 `_dark_ratio` 的说明）；
+      · 单看"是不是黑底"—— 转发卡片点开进的是**卡片详情页**（白底），不是图片查看器，
+        实测两次都因此误判"没点开"。
+      最能说明问题的其实是**画面本身有没有换**：同页面的细微变化（新消息/动画）
+      aHash 距离很小，整页切换则很大。所以拿"点击前 vs 点击后"比一比。
+    """
+    try:
+        from PIL import Image
+        ha = int(_img_ahash(Image.open(a).convert("RGB")), 16)
+        hb = int(_img_ahash(Image.open(b).convert("RGB")), 16)
+        return _ham(ha, hb)
+    except Exception:
+        return -1
+
+
+def _crop_pil(src, bbox):
+    """从截图里裁一块出来（内存里，不落盘）—— 给 zoom_image 认图用。"""
+    from PIL import Image
+    x0, y0, x1, y1 = [int(v) for v in bbox]
+    im = Image.open(src).convert("RGB")
+    x0 = max(0, x0); y0 = max(0, y0)
+    x1 = min(im.width, x1); y1 = min(im.height, y1)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return None
+    return im.crop((x0, y0, x1, y1))
+
+
+def zoom_image(img_hash="", sender=""):
+    """点开屏幕上的那张图 → 截一张**放大图** → 立刻退回。
+
+    ★ 2026-10-15（用户实测确认后才写的）：聊天页里那张缩略图上的小字，OCR 出来是
+      乱码（实测「而明的汗(燃贸穴就口*不填它就田坝」）；而**点开进图片查看器后，
+      大图清清楚楚** —— 同一次实测直接读出了「邵千惠故事馆 / 老公正和我闺蜜在卖力
+      地打扑克，而我躲在床底下…」整段。所以被叫看图时先点开放大、截一张、马上退回，
+      把大图交给视觉模型。
+
+    选图：优先按 ``img_hash``（机器人那侧选中的那张，aHash 匹配，最稳，不受昵称抖动
+    影响）；没给/匹配不上就退化为**屏幕上最靠下的那张别人的图**。
+
+    返回 ``{"ok", "path", "w", "h", "sender", "error"}``。
+    ⚠️ 只点**一次**；点完没进看图页就报错退出（绝不补点）；不管成没成，
+      最后一次一定按返回退出 —— 别把用户的微信留在看图页上。
+    """
+    if wxreader is None:
+        return {"ok": False, "path": "", "error": "wxreader 不可用"}
+    d = _require_did()
+    if d is None:
+        return {"ok": False, "path": "", "error": "读不到虚拟屏号"}
+    if not wechat_front():
+        return {"ok": False, "path": "", "error": "微信不在虚拟屏前台（截不到画面）"}
+    img = "/tmp/wxbridge-zoom-scan.jpg"
+    if not shot(img):
+        return {"ok": False, "path": "", "error": "截图失败"}
+    try:
+        snap = wxreader.parse_snapshot(img)
+    except Exception as exc:
+        return {"ok": False, "path": "", "error": "解析失败：%r" % (exc,)}
+    msgs = [m for m in (snap.get("messages") or [])
+            if m.get("type") == "image" and m.get("bbox")]
+    if not msgs:
+        return {"ok": False, "path": "", "error": "屏幕上没有可点开的图片"}
+
+    want = -1
+    if img_hash:
+        try:
+            want = int(str(img_hash).strip(), 16)
+        except (TypeError, ValueError):
+            want = -1
+
+    hit = None
+    best = None                     # (消息, bbox)，取最靠下的那张别人的图
+    for m in msgs:
+        try:
+            bbox = [int(v) for v in m["bbox"]]
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not m.get("is_self"):
+            if best is None or bbox[3] > best[1][3]:
+                best = (m, bbox)
+        if want < 0 or m.get("is_self"):
+            continue
+        try:
+            pil = _crop_pil(img, bbox)
+            # ⚠️ `_img_ahash` 返回的是 **16 位十六进制字符串**（"%016x"），
+            #   这里要的是整数 —— 2026-10-15 第一次实测就是在这里 TypeError 的。
+            h = int(_img_ahash(pil), 16) if pil is not None else -1
+        except Exception:
+            h = -1
+        if h >= 0 and _ham(h, want) <= IMG_HASH_SAME_DIST:
+            hit = (m, bbox)
+            break
+    pick = hit or best
+    if pick is None:
+        return {"ok": False, "path": "", "error": "屏幕上没有别人的图可点"}
+    m, (x0, y0, x1, y1) = pick
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    before = screen_activity()
+    print("[wxbridge] 点图放大：%s @ (%d,%d) 框(%d,%d-%d,%d)"
+          % (os.path.basename(str(m.get("img_path") or "")), cx, cy, x0, y0, x1, y1),
+          flush=True)
+    if not tap(cx, cy):
+        return {"ok": False, "path": "", "error": "点不动（读不到屏号）"}
+    time.sleep(1.5)                         # 等大图渲染完
+    out = "/tmp/wxbridge-zoom-%d.jpg" % int(time.time())
+    if not shot(out):
+        return {"ok": False, "path": "", "error": "放大页截图失败"}
+    dark = _dark_ratio(out)
+    diff = _shot_diff(img, out)          # img = 点击前那张 scan
+    if dark < 0.25 and diff < 18:
+        # ⚠️ **没进新页面时绝不按返回** —— 聊天页上按一次 BACK 会把微信退回
+        #   会话列表/桌面，那比这条看不了严重得多。
+        return {"ok": False, "path": "",
+                "error": "点开后页面没变化（暗像素 %.2f / 画面差异 %s）"
+                         % (dark, diff)}
+    # 进了看图页 → 立刻退出（一次不够再来一次，但只用**画面**判，不看 activity）
+    adb("input -d %d keyevent 4" % d, 15)
+    time.sleep(0.9)
+    back2 = "/tmp/wxbridge-zoom-back.jpg"
+    if shot(back2) and _dark_ratio(back2) >= 0.25:
+        adb("input -d %d keyevent 4" % d, 15)
+        time.sleep(0.8)
+    try:
+        from PIL import Image
+        W, H = Image.open(out).size
+    except Exception:
+        W, H = 0, 0
+    print("[wxbridge] 点图放大成功：%s %dx%d（暗像素 %.2f / 画面差异 %s，页面 %s）"
+          % (os.path.basename(out), W, H, dark, diff, before or "?"), flush=True)
+    return {"ok": True, "path": out, "w": W, "h": H,
+            "sender": str(m.get("sender") or ""), "error": ""}
+
+
+def read_card(sender="", match=""):
+    """点开屏幕上「那条消息」读整页 OCR —— 给聊天记录之外的卡片用。
+
+    ★ 2026-10-15（用户：「读一下张三的图片」→ 那张其实是**转发的微博图文卡片**，
+      读屏层只读出「@怪我笨图文 / 3.6万 / #如何判断…」这类碎片，视觉模型没图可看）。
+      读不到就**点开它**：微信会把卡片内容整页渲染出来，再整页 OCR。
+      用户选的是「加，并且顺手也认聊天记录以外的卡片」。
+
+    与 ``read_record`` 的区别只在"怎么找到要点的那块"：
+      · ``read_record`` 认标题格式（「XX的聊天记录」）；
+      · 这里认**发送者昵称下面的那块**（`_find_sender_block`）；两者都找不到就不点。
+
+    ⚠️ 安全护栏（一条都不能松）：
+      · 点之前必须在**聊天页**；
+      · 只点**一次** —— 点完页面没变就立刻报错退出，绝不补点第二下；
+      · 读完整页 OCR **立刻返回**，最多退两次，别把用户留在详情页上。
+    """
+    if wxreader is None:
+        return {"ok": False, "title": "", "text": "", "error": "wxreader 不可用"}
+    d = _require_did()
+    if d is None:
+        return {"ok": False, "title": "", "text": "", "error": "读不到虚拟屏号"}
+    if not wechat_front():
+        return {"ok": False, "title": "", "text": "",
+                "error": "微信不在虚拟屏前台（截不到画面）"}
+    before = screen_activity()
+    img = "/tmp/wxbridge-card-scan.jpg"
+    if not shot(img):
+        return {"ok": False, "title": "", "text": "", "error": "截图失败"}
+    # ★ 2026-10-15（第一次真机实测就踩到）：判"在不在聊天页"**不能用 activity** ——
+    #   微信从会话列表点进群时 topResumedActivity 仍然是 LauncherUI（freeform 窗口
+    #   模式，读取层为此专门把判据换成了标题；交接说明也记过）。用它当护栏 = **永远
+    #   拒绝**，这个功能根本进不去（当天 18:44 两次实测都被它挡回）。
+    #   改成读**标题**：会话列表页读作「微信」，聊天页读作群名。
+    t_now = ""
+    try:
+        t_now = str(wxreader.read_title(img) or "").strip()
+    except Exception:
+        t_now = ""
+    if (not t_now) or ("微信" in t_now) or t_now in ("通讯录", "发现", "我"):
+        return {"ok": False, "title": "", "text": "",
+                "error": "当前不在某个聊天页（标题读作 %r / %s），不敢乱点"
+                         % (t_now, before or "?")}
+    rows = _record_ocr_rows(img)
+    H = 0
+    try:
+        from PIL import Image
+        H = Image.open(img).size[1]
+    except Exception:
+        H = 0
+    card = _find_record_card(rows, match) or _find_sender_block(rows, sender, H)
+    if card is None:
+        return {"ok": False, "title": "", "text": "",
+                "error": "屏幕上没找到「%s」发的那条（把它翻到屏幕上再叫它）"
+                         % (sender or match or "?")}
+    y0, x0, x1, y1, title = card
+    cx, cy = (x0 + x1) // 2, (y0 + y1) // 2
+    print("[wxbridge] 读卡片：点开 %r @ (%d,%d)（%d,%d-%d,%d）"
+          % (title, cx, cy, x0, y0, x1, y1), flush=True)
+    if not tap(cx, cy):
+        return {"ok": False, "title": title, "text": "", "error": "点不动（读不到屏号）"}
+    act1 = ""
+    for _ in range(12):                      # 最多等 ~4.8 秒
+        time.sleep(0.4)
+        act1 = screen_activity()
+        if act1 and act1 != before:
+            break
+    if not act1 or act1 == before:
+        adb("input -d %d keyevent 4" % d, 15)
+        return {"ok": False, "title": title, "text": "",
+                "error": "点开后没进新页面（%s），已退出" % (act1 or "?")}
+    time.sleep(0.9)
+    img2 = "/tmp/wxbridge-card-detail.jpg"
+    if not shot(img2):
+        adb("input -d %d keyevent 4" % d, 15)
+        return {"ok": False, "title": title, "text": "",
+                "error": "详情页截图失败（已退出）"}
+    text = _record_clean(_record_ocr_rows(img2))
+    adb("input -d %d keyevent 4" % d, 15)
+    time.sleep(0.8)
+    act2 = screen_activity()
+    if act2 and act2 != before:
+        adb("input -d %d keyevent 4" % d, 15)
+        time.sleep(0.8)
+        act2 = screen_activity()
+    if not text:
+        return {"ok": False, "title": title, "text": "",
+                "error": "读到的页面里没有文字（可能是纯图片卡片）"}
+    print("[wxbridge] 读卡片：%r 读到 %d 字（页面 %s → 回到 %s）"
+          % (title, len(text), act1, act2 or "?"), flush=True)
+    return {"ok": True, "title": title, "text": text, "error": "",
+            "activity": act1, "after": act2}
+
+
 # 会话列表右上角放大镜的候选坐标。
 # 2026-10-03 实测：微信在虚拟屏上被 freeform 窗口装饰挤下了一行 —— 屏幕上多出
 # 一条「微…」的窗口标题栏，微信自己的标题栏（带放大镜）落到 y≈170，
@@ -3990,8 +4613,13 @@ def goto_search(tries=3):
     return False
 
 
-def _chat_title_now(img):
+def _chat_title_now(img, diag=None):
     """当前**真的**停在某个聊天页吗？是就返回 OCR 读到的标题，否则返回 ""。
+
+    ``diag`` 传一个 dict 时把「为什么读空」的原因写进 ``diag["why"]`` ——
+    ★ 2026-10-16 加：这条函数读空时**一个字的日志都不打**，历史上日志里只能看到
+      「标题读不出（''）」，看不出是截图坏了、停在搜索页、还是底部 tab 判绿了。
+      三条判据任意一条不成立都返回 ""，没有 diag 时行为与以前完全一致。
 
     ★ 2026-10-10（切群改成"会话列表里直接点"之后补的）：判据与 `_already_in_chat`
       完全一致，抽出来给 `/where`、`/send` 的会话核对共用 —— 它们原来用
@@ -4006,15 +4634,226 @@ def _chat_title_now(img):
       ③ 底部「微信」tab 不绿（绿 = 其实还停在会话列表，标题读到的是第一行群名）。
     """
     if wxreader is None:
+        if diag is not None:
+            diag["why"] = "wxreader 未加载"
         return ""
     if screen_activity() == WX_SEARCH:
+        if diag is not None:
+            diag["why"] = "停在微信搜索页"
         return ""
     title = (wxreader.read_title(img) or "").strip()
     if not re.search(r"[\u4e00-\u9fff]", title):
+        if diag is not None:
+            diag["why"] = "标题条没有中文（OCR 读空或读残：%r）" % title
         return ""
     if _bottom_tab_green(img):
+        if diag is not None:
+            diag["why"] = "底部「微信」tab 判绿（其实停在会话列表）"
         return ""
     return title
+
+
+# ★ 2026-10-16：会话校验改成**多帧投票** —— 起因是用户报「前一条发出去了，
+#   后一条就不确定是不是在目标群」（08:46/08:48/08:49 连续三次）。
+#   现场铁证：`/send` 说读不出（''）→ 它调 `open_chat(verify=True)` 去核对，
+#   而 `open_chat` 里的 `_already_in_chat` **调的同一个 `_chat_title_now`** 却说
+#   "已经在目标会话" → 紧接着 `/send` 再读一次又读不出。同一函数、同一屏幕、
+#   相隔 1 秒，一次成功一次失败 = **读空是随机的瞬时故障**（抓到了画面切换的
+#   半截帧 / 微信被挤下虚拟屏的那一瞬），不是"真的不在目标群"。
+#   代价：这条被拒发 → 挂补发队列 → 几秒后补上（只是延迟，不是错发/漏发）。
+#   为什么敢多帧投票：**确认在目标群只要有一帧铁证就够**，而"发错群"才是不可逆的
+#   那件事 —— 所以规则是「任一帧读到目标群标题 → 放行；读到别的会话 → 立刻拒发；
+#   全部读不出 → 走原来的切群 + 再核对」。第一帧就匹配时零额外开销。
+_TITLE_VOTE_FRAMES = max(1, int(os.environ.get("WXBRIDGE_TITLE_VOTE_FRAMES", "3")))
+_TITLE_VOTE_GAP = float(os.environ.get("WXBRIDGE_TITLE_VOTE_GAP", "0.6"))
+_TITLE_FAIL_KEEP = max(0, int(os.environ.get("WXBRIDGE_TITLE_FAIL_KEEP", "20")))
+
+
+def _title_probe(img, diag):
+    """读一帧标题，返回 (标题, 失败原因)。截图失败也算读空。"""
+    if not shot_wechat(img):
+        diag["why"] = "截图失败（微信不在虚拟屏前台？）"
+        return "", diag["why"]
+    return _chat_title_now(img, diag=diag), diag.get("why", "")
+
+
+def _keep_title_fail_frame(src, tag=""):
+    """把读空的那一帧留一份现场（带时间戳），别让它被下一帧覆盖掉。
+
+    历史教训：`/tmp/wxbridge-where.jpg` 每帧都覆盖同一个文件名，事后再想查
+    "当时到底抓到了什么"已经无从查起。这里只保留最近 `_TITLE_FAIL_KEEP` 张。
+    """
+    if _TITLE_FAIL_KEEP <= 0:
+        return ""
+    try:
+        import glob as _glob
+        import shutil as _sh
+        dst = time.strftime("/tmp/wxbridge-titlefail-%Y%m%d-%H%M%S")
+        if tag:
+            dst += "-" + str(tag)
+        dst += ".jpg"
+        _sh.copy(src, dst)
+        old = sorted(_glob.glob("/tmp/wxbridge-titlefail-*.jpg"))
+        for f in old[:-_TITLE_FAIL_KEEP]:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        return dst
+    except Exception:
+        return ""
+
+
+def _title_vote(want, keep=False):
+    """连抓 N 帧投票：现在到底在不在目标会话？
+
+    返回 ``(verdict, title, notes)``：
+      · ``True``  —— 至少一帧读到且匹配目标群（放行；立即返回，不做无谓的多抓）
+      · ``False`` —— 读到了**别的**会话名（拒发，title 是读到的那个名字）
+      · ``None``  —— 每一帧都读不出（交给调用方：先切回目标群再投票）
+    """
+    notes = []
+    wrong = ""
+    img = "/tmp/wxbridge-where.jpg"
+    for i in range(_TITLE_VOTE_FRAMES):
+        if i:
+            time.sleep(_TITLE_VOTE_GAP)
+        diag = {}
+        title, _why = _title_probe(img, diag)
+        # 口径与历史行为一致：只有 >=2 个字符的标题才算"读到了会话名"，
+        # 单个汉字（OCR 读残，如把「目标群」读成「缺」）按"读不出"处理。
+        _clean = title.replace("…", ".").strip(". ")
+        if len(_clean) >= 2:
+            if wxreader is not None and wxreader.match_title(title, want):
+                return True, title, notes
+            wrong = title
+            notes.append("第%d帧读到别的会话「%s」" % (i + 1, title))
+            break                      # 读到别的会话：立刻拒发，不继续抓
+        if title:
+            notes.append("第%d帧只读到 %r（读残）" % (i + 1, title))
+        else:
+            why = diag.get("why") or "原因未知"
+            notes.append("第%d帧读不出（%s）" % (i + 1, why))
+        if keep:
+            _keep_title_fail_frame(img, "f%d" % (i + 1))
+    return (False if wrong else None), wrong, notes
+
+
+def _vsd_frames():
+    """问虚拟屏守护：这块屏**累计出过多少帧**（读不到返回 None）。
+
+    ★ 2026-10-16：`frames` 是守护的 ImageReader 回调里自增的（每来一个新帧 +1），
+      **与有没有客户端取图无关**。
+      ⚠️ 实测修正（别拿它单独当冻结证据）：**虚拟屏内容不变时 Android 本来就不产
+      新帧** —— 实测静止时 2 秒不涨是常态，有变化时才涨。所以「frames 不涨」
+      只能当"要不要继续复核"的信号，定案交给 `_disturb_and_verify()`。
+    """
+    try:
+        import json as _json
+        import urllib.request as _u
+        url = "http://127.0.0.1:%d/list" % int(os.environ.get("VSD_PORT", "18250"))
+        with _u.urlopen(url, timeout=4) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+        _d = did()
+        best = None
+        for item in data:
+            if _d is not None and int(item.get("displayId", -1)) == int(_d):
+                return int(item.get("frames") or 0)
+            if best is None and int(item.get("i", -1)) == int(SLOT):
+                best = int(item.get("frames") or 0)
+        return best
+    except Exception:
+        return None
+
+
+def _vsd_other_display():
+    """除当前操作的那块屏之外，另一块**虚拟屏**的 displayId（没有就 None）。
+
+    给扰动复验用：要把微信 task 搬到别处再搬回，才能逼出一次必然的重绘。
+    `displayId > 0` 同时把物理屏（0）排除掉 —— 绝不能把微信搬去用户正看着的屏。
+    """
+    try:
+        import json as _json
+        import urllib.request as _u
+        url = "http://127.0.0.1:%d/list" % int(os.environ.get("VSD_PORT", "18250"))
+        with _u.urlopen(url, timeout=4) as r:
+            data = _json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    _d = did()
+    for item in data:
+        try:
+            i = int(item.get("displayId", -1))
+        except Exception:
+            continue
+        if i > 0 and i != _d:
+            return i
+    return None
+
+
+def _disturb_and_verify():
+    """主动扰动一次，**这是判定"真冻结"唯一能定案的手段**（2026-10-16 用户拍板加上）。
+
+    原理：画面 md5 不变、守护 `frames` 不涨，都可能只是"群里真的没新内容"
+    （实测虚拟屏内容不变时 Android 本来就不产新帧）；只有**做一个必然引起重绘的
+    动作**再看画面动不动，才能区分"静"和"冻"。
+    动作：把微信 task 用 `cmd activity display move-stack` 搬到另一块虚拟屏、再搬回
+    （不是 `am start` —— 同一 display 上重放窗口是 no-op，而它到别的 display 是
+    真的重排 + 重绘；move-stack 也不解析 Intent、不动 Activity 栈，聊天页不会丢）。
+
+    返回：``True`` 屏活着 / ``False`` 扰动后纹丝不动（真冻）/ ``None`` 做不了。
+    ⚠️ 有副作用（几秒内微信会闪到另一块屏），所以只在"连续 20 轮画面不变 + 帧不涨
+      + 连标题都读不出"之后才调用。
+    """
+    _home = did()
+    _other = _vsd_other_display()
+    _tid = _wx_root_task_id()
+    if _home is None or _other is None or _tid is None:
+        return None
+    before = ""
+    try:
+        _p0 = "/tmp/wxbridge-disturb-before.jpg"
+        if shot_wechat(_p0):
+            with open(_p0, "rb") as fh:
+                before = hashlib.md5(fh.read()).hexdigest()
+    except Exception:
+        before = ""
+    _f0 = _vsd_frames()
+    print("[wxbridge] 冻结复核：主动扰动 —— 微信 task %d 搬到屏 %d 再搬回"
+          % (_tid, _other), flush=True)
+    adb("cmd activity display move-stack %d %d" % (_tid, _other), 25)
+    time.sleep(1.5)
+    adb("cmd activity display move-stack %d %d" % (_tid, _home), 25)
+    time.sleep(1.5)
+    if not wechat_front():
+        # 搬回来失败 = 微信正留在别的屏上，比"读不到画面"更严重，必须当场喊
+        print("[wxbridge] ⚠️ 扰动后微信没回到屏 %s，再搬一次" % _home, flush=True)
+        adb("cmd activity display move-stack %d %d" % (_tid, _home), 25)
+        time.sleep(1.5)
+        if not wechat_front():
+            print("[wxbridge] ⚠️⚠️ 扰动后微信仍未回到屏 %s —— 需要人工恢复："
+                  "bash /sdcard/dsh/wechat-bot/app/bot.sh start --restart" % _home,
+                  flush=True)
+    _f1 = _vsd_frames()
+    after = ""
+    try:
+        _p1 = "/tmp/wxbridge-disturb-after.jpg"
+        if shot_wechat(_p1):
+            with open(_p1, "rb") as fh:
+                after = hashlib.md5(fh.read()).hexdigest()
+    except Exception:
+        after = ""
+    if _f0 is not None and _f1 is not None and _f1 > _f0:
+        print("[wxbridge] 扰动复验：frames %d→%d（涨了）→ 屏活着" % (_f0, _f1),
+              flush=True)
+        return True
+    if before and after and after != before:
+        print("[wxbridge] 扰动复验：画面 md5 变了（%s→%s）→ 屏活着"
+              % (before[:8], after[:8]), flush=True)
+        return True
+    print("[wxbridge] 扰动复验：frames %s→%s、画面 md5 %s→%s 都没动 → 真冻结"
+          % (_f0, _f1, (before or "-")[:8], (after or "-")[:8]), flush=True)
+    return False
 
 
 WX_MAIN_ACTS = ("com.tencent.mm.ui.LauncherUI",
@@ -4025,7 +4864,7 @@ def wx_main_windows(dpy=None):
     """虚拟屏上现在显示着几个**微信主窗口**（会话列表 / 聊天页）。
 
     ★ 2026-10-11 事故（用户报「机器人把之前的话发给我妈了」）：
-      现场截图 `/tmp/wxbridge-after-send.jpg` 显示 —— 目标群群聊天页在底下，**另一个
+      现场截图 `/tmp/wxbridge-after-send.jpg` 显示 —— 目标群聊天页在底下，**另一个
       会话（妈妈）以小窗浮在上面**。而桥接的会话核对 `_chat_title_now()` 只读屏幕
       **顶部标题条**，读到的是底层的「目标群(110)」→ 判定"在目标群" → 接着 commit
       文字、点发送。可输入法连接挂的是**持有焦点的小窗**（不是被点到底层那个输入框），
@@ -4053,7 +4892,7 @@ def wx_main_windows(dpy=None):
         #   打开时它仍在窗口列表里、只是 mViewVisibility=0x8(GONE)。不加这道过滤，
         #   正常聊天页也会数出 2 个 → 机器人**什么都发不出去**。
         #   实测：正常聊天页 ChattingUI 可见(0x0) + LauncherUI GONE(0x8) = 1；
-        #   事故现场（目标群群 + 妈妈小窗）两个都可见 = 2。
+        #   事故现场（目标群 + 妈妈小窗）两个都可见 = 2。
         mv = re.search(r"mViewVisibility=(0x[0-9a-fA-F]+)", blk)
         if mv and int(mv.group(1), 16) != 0:
             continue
@@ -4078,7 +4917,7 @@ def _already_in_chat(name, img=None):
     img = img or "/tmp/wxbridge-open.jpg"
     if not shot_wechat(img):
         return False
-    # ★ 2026-10-10（用户报「我在物理屏把微信切到了目标群群，机器人还需要切群吗」）：
+    # ★ 2026-10-10（用户报「我在物理屏把微信切到了目标群，机器人还需要切群吗」）：
     #   这里原来要求 `on_chat_page()`（activity == ChattingUI），实测**从会话列表
     #   点进去**时微信聊天页的 activity 仍然是 LauncherUI（微信是单 Activity +
     #   fragment），只有搜索框那条路进去才是 ChattingUI —— 于是"已经在群里"被判
@@ -4099,7 +4938,7 @@ def _find_chat_row(img, name, ytop=150):
       用户报的「机器人反复抢键盘」就是它。会话列表里直接点一下，全程不碰输入法。
     判据（宁可不点，也别点错人）：
       · 只认含目标名的行，且**文本长度不超过 名字+6 字**（消息预览通常更长）；
-      · 取**最上面**那一行（用户的目标群群是置顶的）；
+      · 取**最上面**那一行（用户的目标群是置顶的）；
       · 只在列表区域找（标题栏以下、底部 tab 栏以上）。
     """
     if wxreader is None or not name:
@@ -4203,7 +5042,7 @@ def _open_chat_by_list(name):
 def _try_open_by_list(name):
     """只走「会话列表里直接点」这条路 —— **不借输入法、不协商、不弹预告、不抢屏**。
 
-    ★ 2026-10-10（用户要求「直接在屏幕点击置顶的目标群群，尽量不走搜索」）：
+    ★ 2026-10-10（用户要求「直接在屏幕点击置顶的目标群，尽量不走搜索」）：
       `open_chat()` 现在先调它，成功就直接返回。以前不管走哪条路都先
       `preflight_yield()`：弹抢屏预告 + 震动（真要抢的时候还按 HOME 把用户的
       界面切到后台），可"列表里点一下"根本不需要键盘 —— 用户报的"机器人总在
@@ -4235,7 +5074,7 @@ def open_chat(name, verify=True):
         print("[wxbridge] /open %s：已经在目标会话，直接放行（不协商、不抢屏）" % name,
               flush=True)
         return True
-    # ★ 2026-10-10（用户要求「直接在屏幕点击置顶的目标群群，尽量不走搜索」）：
+    # ★ 2026-10-10（用户要求「直接在屏幕点击置顶的目标群，尽量不走搜索」）：
     #   先试**不借键盘**的那条路 —— 会话列表里点一下。成了就到此为止：
     #   不协商、不弹抢屏预告、不震动、不碰物理屏。
     #   以前不管走哪条路都先 `preflight_yield()`：明明列表点不需要键盘，却照样
@@ -4264,10 +5103,8 @@ def open_chat(name, verify=True):
     finally:
         if _pf_prev:
             restore_physical_app(_pf_prev)
-            _hud_notice("键盘已经还给你了", seconds=6,
-                        title="✅ 借屏结束 · 可以拿手机了",
-                        detail="刚才是机器人切群临时借了一下")
-            _hud_buzz()
+            # ★ 2026-10-14：统一走 `_hud_released()`（和"发完消息"那条标题正文一致）
+            _hud_released("切群")
 
 
 def _open_chat_inner(name, verify=True):
@@ -4371,13 +5208,20 @@ def _open_chat_inner(name, verify=True):
 #   · 微信两屏的前台都不是它，持续 RECLAIM_IDLE 秒 → 自动收回（搬回虚拟屏 +
 #     切回目标群），机器人随之恢复读屏；
 #   · 机器人没在跑 → 什么都不做（桥接可能只是面板留着，别去抢用户的微信）。
-RECLAIM_IDLE = float(os.environ.get("WX_RECLAIM_IDLE", "10"))
+RECLAIM_IDLE = float(os.environ.get("WX_RECLAIM_IDLE", "5"))
 # 看护线程的轮询间隔（秒）。**这个值直接决定常驻负载**：每一跳都要跑一次
 # `dumpsys activity activities`（Android 上很重）。2026-10-05 用户报「手机卡卡的」，
 # 实测 wxbridge 85 分钟烧了 27 分钟 CPU —— 主要就是这里 3 秒一跳。调到 10 秒后
-# 调用次数降到 1/3；代价是「用户切走微信后自动收回」最坏慢 10 秒，
-# 而 WX_RECLAIM_IDLE 本来就是 10 秒，体感差别不大。
-RECLAIM_TICK = 10.0
+# 调用次数降到 1/3；代价是「用户切走微信后自动收回」最坏慢 10 秒。
+# ★ 2026-10-14（用户要求「自动归还的 10 秒改成 5 秒」）：⚠️ 光改 RECLAIM_IDLE **没用** ——
+#   `idle` 是按**这个值累加**的（见 `reclaim_watch`：`idle += RECLAIM_TICK`），
+#   粒度不降下去的话，第一跳就累加到 10 ≥ 5、**立刻**收回，等于"完全不缓冲"
+#   （用户切出去看一眼别的 App 再切回来，微信已经被抢没了）。
+#   所以两个**必须一起改**：IDLE 10→5、TICK 10→5。实际效果：用户切走后
+#   0~5 秒收回（原来 0~10 秒）。
+#   代价：dumpsys 频率翻倍 —— 2 倍负载，仍**远低于**当年 3 秒那一档。
+#   真觉得费电/卡，把两个都调回去（WX_RECLAIM_IDLE=10 且 TICK 改回 10.0）。
+RECLAIM_TICK = 5.0
 
 # ★ 2026-10-09（续13）用户问「微信卡在搜索页能自动恢复吗」—— 之前**不能**：
 #   今天 12:14 那次机器人启动切群失败（搜索框没吃进字），进程直接退出，
@@ -4570,11 +5414,11 @@ def _ime_unstick():
         print("[wxbridge] ⚠️ 自动还回没成功，下一轮再试", flush=True)
         return
     try:
-        # 用户报的就是"不知道键盘怎么没了" —— 还回来的这一下要说一声
-        _hud_notice("输入法已经还给你了", seconds=6,
-                    title="⌨️ 微信机器人 · 输入法已还回",
-                    detail="刚才是它打字时借走了没还，现在恢复成 %s"
-                           % back.split("/")[0])
+        # 用户报的就是"不知道键盘怎么没了" —— 还回来的这一下要说一声。
+        # ★ 2026-10-14：统一走 `_hud_released()`，标题正文和"借屏结束"完全一致，
+        #   只有细节行说明这次是"打字借走了输入法没还"（原来是另一套「输入法已还回」）。
+        _hud_released(detail="刚才它打字借走了输入法没还，现在恢复成 %s"
+                             % back.split("/")[0])
     except Exception:
         pass
 
@@ -4582,8 +5426,10 @@ def _ime_unstick():
 def reclaim_watch():
     """后台线程：用户看完微信又切走了，就替他把微信收回来。
 
-    ⚠️ 用户明确要求 10 秒这一档（WX_RECLAIM_IDLE 可调）——
-    他拿手机看一眼、按 home，10 秒后机器人自己恢复，全程零操作。
+    ⚠️ 缓冲时长 = ``RECLAIM_IDLE``（2026-10-04 用户定的 10 秒；★ 2026-10-14 用户
+    看了「你把微信抢回手上 → 机器人读不到画面」的三次日志后，改成 **5 秒** ——
+    他切走后更快恢复，代价是"切出去再马上切回来"可能被抓走，见常量处的说明）。
+    他拿手机看一眼、按 home，几秒后机器人自己恢复，全程零操作。
 
     ★ 2026-10-09（续13）：多了一件"卡在搜索页就点返回"的活（`_unstick_search`），
     而且那一件**在 `bot_running()` 判断之前**做 —— 机器人没跑起来时微信卡住，
@@ -4810,7 +5656,8 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {}
             with _lock:
                 out = backfill(payload.get("screens") or 2,
-                               str(payload.get("chat") or ""))
+                               str(payload.get("chat") or ""),
+                               bool(payload.get("images")))
             self._json(out)
             return
         if self.path.startswith("/read_record"):
@@ -4823,6 +5670,30 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {}
             with _lock:
                 out = read_record(str(payload.get("match") or ""))
+            self._json(out)
+            return
+        if self.path.startswith("/zoom_image"):
+            # ★ 2026-10-15：把屏幕上那张图点开放大、截一张、立刻退回（缩略图小字读不清时用）
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                payload = {}
+            with _lock:
+                out = zoom_image(str(payload.get("img_hash") or ""),
+                                 str(payload.get("sender") or ""))
+            self._json(out)
+            return
+        if self.path.startswith("/read_card"):
+            # ★ 2026-10-15：点开"某人的那条消息"读整页 OCR（卡片不是图片时用）
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                payload = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except Exception:
+                payload = {}
+            with _lock:
+                out = read_card(str(payload.get("sender") or ""),
+                                str(payload.get("match") or ""))
             self._json(out)
             return
         if self.path.startswith("/send_image"):

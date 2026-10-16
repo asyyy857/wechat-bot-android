@@ -2,7 +2,7 @@
 """从 chat_log.json + 群成员前缀 构建 名字库.json。
 
 为什么要有名字库：实测 chat_log 里 **5~8% 的 sender 是「昵称和正文被 OCR 粘成
-一个框」**（`群友I潮光：因为我们宿舍六点半大门才开`），同一个人在 memory 里被记成
+一个框」**（`某某某某：因为我们宿舍六点半大门才开`），同一个人在 memory 里被记成
 几十个不同的人。有了名字库就能拿它做前缀切分，把昵称切出来。
 
 数据来源两条：
@@ -106,7 +106,7 @@ def main():
             print("! 读群成员前缀失败：%r" % (exc,))
     senders = [s for s in collect_senders() if s]
 
-    # 归一化聚合：同一个人的不同写法（群友I 潮光 / 群友I潮光）算一个
+    # 归一化聚合：同一个人的不同写法（某某 某某 / 某某某某）算一个
     agg = collections.Counter()
     best = {}
     for s in senders:

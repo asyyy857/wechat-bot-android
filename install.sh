@@ -1,6 +1,6 @@
 #!/bin/sh
 # ============================================================================
-#  微信机器人 v2.0.0 · 安装 / 升级程序
+#  微信机器人 v2.1.3 · 安装 / 升级程序
 #
 #  用法（⚠️ /sdcard 是 noexec，必须用解释器调用，不能 ./install.sh）：
 #      sh install.sh                 # 智能安装：新装铺全量；已装则只换程序
@@ -46,7 +46,7 @@ say() { printf '%s\n' "$*"; }
 hr()  { say "------------------------------------------------------------"; }
 run() { if [ "$DRY" = "1" ]; then say "   [dry-run] $*"; else "$@"; fi; }
 
-hr; say "微信机器人 v2.0.0  安装程序"; hr
+hr; say "微信机器人 v2.1.3  安装程序"; hr
 
 # ---------------------------------------------------------------- 0) 环境自检
 [ -d "$PAYLOAD" ] || { say "❌ 找不到 $PAYLOAD —— 请先完整解压压缩包再运行本脚本"; exit 1; }
@@ -189,7 +189,7 @@ fi
 
 # ---------------------------------------------------------------- 6) 环境件
 hr; say "[5/5] 环境件（虚拟屏守护 / 命令守护 / 输入法 / 工具链）..."
-for item in vscreen-daemon shell-daemon clip-app vscreen-src tools; do
+for item in vscreen-daemon shell-daemon clip-app vscreen-src tools hud; do
   if [ -d "$PAYLOAD/$item" ]; then
     run cp -a "$PAYLOAD/$item" "$DEST/"
     say "   → $item"

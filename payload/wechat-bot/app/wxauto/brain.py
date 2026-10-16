@@ -111,7 +111,7 @@ INTEREST_WORDS = {
     # ⚠️ 2026-10-07 用户：「关于逆水寒职业这些兴趣点还是删了吧，机器人不懂乱发。
     #    龙吟素问潮光这些」—— 9 个门派名（玄机/碎梦/龙吟/素问/铁衣/血河/神相/
     #    九灵/潮光）**全部删掉**，不再作为主动接话的理由。
-    #    ★「素问」尤其必须删：群里有好几个人昵称就叫「群友C」「群友D」，
+    #    ★ 职业名尤其必须删：群里有好几个人昵称以职业名打头（「张三」那类），
     #      留着它等于**每条带该昵称的消息都触发**主动接话（实测群里刷得很频繁）。
     "铜币": 2, "天赏": 2, "结义": 2,
     "约战": 2, "摇人": 2, "拔旗": 2, "对拆": 2, "大龙团": 2, "帮会": 2,
@@ -369,9 +369,9 @@ class Brain:
     def is_mention(self, text: str) -> bool:
         """这句话是不是在叫我。
 
-        ★ 2026-10-09（续12）：比较改成**大小写不敏感**。主人给机器人起的称呼是
-        「昵称」，群里打成「小AI / 小Ai / 小aI」都算在叫它（用户明确要求"大小写
-        都认"）。中文昵称不受影响 —— `lower()` 对汉字是恒等变换，
+        ★ 2026-10-09（续12）：比较改成**大小写不敏感**。配置里填的称呼（英文 / 拼音
+        那种）群里打成大小写变体都算在叫它（用户明确要求"大小写都认"）。
+        纯中文昵称不受影响 —— `lower()` 对汉字是恒等变换，
         `normalize()` 照旧先去掉所有空白。
         """
         t = normalize(text).lower()
@@ -928,6 +928,37 @@ class Brain:
           冷却一过自然放一次请求试探，成功即复位。
         · 所有调用方遇到 None 本来就是「放行 / 跳过」，所以熔断对上层透明。
         """
+        # ★ 2026-10-15（修 bug）：payload 私有键 `_no_effort` = 这次**不要**自动补
+        #   reasoning_effort。必须先弹掉，绝不能把它发给接口。
+        #   为什么要它：抽取 / 摘要类请求（memlearn 学记忆、groupsum 群情摘要）
+        #   要的是「直接吐结果」，传了 effort 会被**强制**拖进推理模式，reasoning
+        #   先吃 max_tokens。2026-10-15 实测（deepseek-chat，同一段流水）：
+        #     · 不传 effort、max_tokens=500 → 1.2s、finish=stop、正文 159 字；
+        #     · 传 high、max_tokens=500 → 3.2s、finish=**length**、reasoning 1392 字
+        #       吃光额度、正文只剩 47 字（JSON 被截断 → 记忆库连着两天学 0 条）；
+        #     · 传 low、max_tokens=400 → 正文 **0 字**（群情摘要每轮丢空、疯狂重试）。
+        #   所以凡是「把返回值当数据解析」的调用都带上 `_no_effort: True`。
+        _no_effort = bool(payload.pop("_no_effort", False))
+        # ★ 2026-10-13 用户要求：「文字回复也加 reasoning_effort: low」。
+        #   V4.1-Flash 是推理模型、effort 默认 high —— 每句闲聊都会先烧一截
+        #   reasoning token（正文之外另计费）。这里只补**没显式设过**的请求：
+        #   识图那条在 payload 里已经带了 `vision_reasoning_effort`，不受影响。
+        #   配置留空 = 不带这个参数（兼容不认它的 OpenAI 兼容服务）。
+        if not _no_effort and "reasoning_effort" not in payload:
+            _eff = str(getattr(self.cfg, "reasoning_effort", "") or "")
+            # ⚠️ 只补**有正文空间**的请求。实测（2026-10-13，V4.1-Flash）：
+            #   · 不传 reasoning_effort  → reasoning=0，直接答（最省）；
+            #   · 传了（哪怕 low）      → **强制**进推理模式，reasoning **先吃**
+            #     max_tokens：max_tokens=8 时 8 个全被吃掉、content 为空、
+            #     finish_reason=length；给到 256 才吐出正文（reasoning≈107）。
+            #   所以判定类请求（自检 / 选工具，只要一个词、max_tokens=8）
+            #   **绝不能**带 effort，否则一律判空 → 正常回复被整条毙掉。
+            try:
+                _mt = int(payload.get("max_tokens") or 0)
+            except (TypeError, ValueError):
+                _mt = 0
+            if _eff and _mt >= 200:
+                payload["reasoning_effort"] = _eff
         now = time.time()
         if self._open_until and now < self._open_until:
             self.skipped += 1
@@ -1131,6 +1162,25 @@ class Brain:
         """这句回复是不是在自白"我读不出 / 全是乱码"？是 → 该丢，别发。"""
         return bool(self._READ_FAIL_RE.search(normalize(text or "")))
 
+    def _effort_for(self, deep: bool) -> str:
+        """按场景取 ``reasoning_effort``（大白话：答题前先在草稿纸上想几步）。
+
+        · ``deep=True``  —— "真要动脑子"的调用：被 @ 认真答 / 点名问事 /
+          读 PPT / 读聊天记录 → 用 ``reasoning_effort_deep``（high）。
+        · ``deep=False`` —— 平时接话 / 主动插话 → 用 ``reasoning_effort``（low）。
+        · 留空 = 不带该参数 = **完全不思考**（实测 V4.1-Flash 不传时 reasoning=0）。
+
+        ★ 2026-10-13 用户口径：「我要更智能的回复，同时避免不必要的思考，不需要
+        一个劲省 token」—— 分档就是为这个：该想的地方给 high，不该想的地方
+        （判定类）一点不烧。
+
+        ⚠️ 显式传 effort 会**强制**进推理模式，且 reasoning **先吃** `max_tokens`
+        （实测 max_tokens=8 时正文直接为空）。判定类请求（自检 / 选工具，只要
+        一个词）不要用这个函数、也别带 effort —— 它们走 `_post` 的门槛就不带。
+        """
+        key = "reasoning_effort_deep" if deep else "reasoning_effort"
+        return str(getattr(self.cfg, key, "") or "")
+
     def check_readable(self, text):
         """这句发进群里，没看过上下文的人看得懂吗？返回 (ok, 模型原话)。"""
         t = (text or "").strip()
@@ -1162,6 +1212,10 @@ class Brain:
         try:
             ans = (body["choices"][0]["message"]["content"] or "").strip().upper()
         except Exception:
+            return True, ""
+        if not ans:
+            # 模型返回空（例如 token 全被 reasoning 吃掉）→ **放行**：自检是加分项，
+            # 不能因为"判不出来"就把正常回复全毙掉（同上面接口挂了那条口径）。
             return True, ""
         ok = ("OK" in ans) and ("NO" not in ans)
         return ok, ans[:16]
@@ -1305,6 +1359,11 @@ class Brain:
             "temperature": float(getattr(self.cfg, "temperature", 1.3)),
             "stream": False,
         }
+        # ★ 2026-10-13 分档（见 _effort_for）：被 @ 认真答 / 点名问事 → high；
+        #   平时接话 / 主动插话 → low。
+        _eff = self._effort_for(bool(expand or quote_ask or own_ask))
+        if _eff:
+            payload["reasoning_effort"] = _eff
         body = self._post(payload)
         if not body:
             return None
@@ -1418,6 +1477,7 @@ class Brain:
                 {"role": "user", "content": user},
             ],
             "max_tokens": int(getattr(self.cfg, "max_tokens", 60)),
+            "reasoning_effort": self._effort_for(True),   # deep：读文档/记录要动脑
             "temperature": float(getattr(self.cfg, "temperature", 1.3)),
             "stream": False,
         }
@@ -1507,6 +1567,7 @@ class Brain:
                 {"role": "user", "content": user},
             ],
             "max_tokens": int(getattr(self.cfg, "max_tokens", 60)),
+            "reasoning_effort": self._effort_for(True),   # deep：读文档/记录要动脑
             "temperature": float(getattr(self.cfg, "temperature", 1.3)),
             "stream": False,
         }
@@ -1565,6 +1626,7 @@ class Brain:
                 {"role": "user", "content": user},
             ],
             "max_tokens": int(getattr(self.cfg, "max_tokens", 60)),
+            "reasoning_effort": self._effort_for(True),   # deep：读文档/记录要动脑
             "temperature": float(getattr(self.cfg, "temperature", 1.3)),
             "stream": False,
         }

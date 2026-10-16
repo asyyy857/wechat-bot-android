@@ -31,10 +31,27 @@ sh "$DSH_ROOT/restore-agents.sh" >/dev/null 2>&1 || true
 
 # ★ 2026-10-06：这个脚本现在会被 DSH 自启插件**每次开机都调一次**，
 #   所以第一件事是"看好就别动" —— 否则每次打开 App 都会白重启一次机器人。
-if pgrep -f '[m]ain_android' >/dev/null 2>&1; then
-  echo "机器人已经在跑 —— 什么都不做（要看细节就 bash wechat-bot/app/bot.sh status）"
+# ★ 2026-10-14：判据从「机器人进程在不在」升级为「机器人 + adb + 两个守护」——
+#   机器人在跑也可能是**瞎的**：adb 断 / 守护全灭时它 pid 好好的，只是连报
+#   「读不到画面」、群里一条都不理。老判据这时会直接 exit 0，一个东西都不修 ——
+#   2026-10-14 那次「整晚机器人不理人」就是这么漏过去的。
+_problem=""
+if ! pgrep -f '[m]ain_android' >/dev/null 2>&1; then
+  _problem="机器人没在跑"
+elif ! adb devices 2>/dev/null | grep -q 'device$'; then
+  _problem="adb 断了"
+else
+  _tok=$(cat "$DSH_ROOT/.shd-token" 2>/dev/null || true)
+  curl -s -m 5 -H "X-Token: $_tok" "http://127.0.0.1:$SHD_PORT/health" 2>/dev/null | grep -q uid=2000 \
+    || _problem="命令守护没了"
+  [ -n "$_problem" ] || curl -s -m 5 -H "X-Token: $_tok" "http://127.0.0.1:$VSD_PORT/list" 2>/dev/null | grep -q trusted \
+    || _problem="虚拟屏守护没了"
+fi
+if [ -z "$_problem" ]; then
+  echo "机器人在跑，adb + 两个守护都正常 —— 什么都不做（要看细节就 bash wechat-bot/app/bot.sh status）"
   exit 0
 fi
+echo "⚠️ 体检：$_problem → 继续走修复流程（每一步都幂等，已在跑的部分会跳过）"
 
 echo "=== 1/4 容器环境 ==="
 # 只在关键命令缺失时跑 bootstrap（它要联网装东西，慢）

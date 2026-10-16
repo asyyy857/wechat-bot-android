@@ -27,12 +27,21 @@ from pathlib import Path as _Path
 
 _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from wxauto.paths import DATA_DIR as _DATA_DIR, LOGS_DIR as _LOGS_DIR
+    from wxauto.paths import (APP_DIR as _APP_DIR, DATA_DIR as _DATA_DIR,
+                              LOGS_DIR as _LOGS_DIR)
 except Exception:                       # 极端情况：包导入失败也别让面板起不来
+    _APP_DIR = _Path(os.path.dirname(os.path.abspath(__file__)))
     _DATA_DIR = _Path("/sdcard/dsh/wechat-bot/data")
     _LOGS_DIR = _Path("/sdcard/dsh/wechat-bot/logs")
 
+# ⚠️ 两个目录别搞混（v2.0.0 是"程序 / 数据"分离）：
+#   DIR    = **数据**目录（chat_log.json / config.yaml / 表情包 / STOP.txt …）
+#   APPDIR = **程序**目录（bot.sh / wxbridge_ctl.sh / simulate.py / wxauto 包 …）
+# 2026-10-13 用户报「面板主动接话坏了」的根因就在这里：迁移时只把 DIR 指到
+# data/，可**脚本路径和 `sys.path` 还挂在 DIR 上** → 子进程"文件不存在"、
+# `import wxauto` 也失败，面板一半按钮静默坏掉（/fight/pick 直接 500）。
 DIR = str(_DATA_DIR)
+APPDIR = str(_APP_DIR)
 PORT = int(os.environ.get("BOTCTL_PORT", "8790"))
 BRIDGE = "http://127.0.0.1:8765"
 PHONE = "http://127.0.0.1:3099"      # 无障碍桥：能问出物理屏前台是哪个 App
@@ -43,7 +52,7 @@ PAT = r"main_android\.py"
 _DESTRUCTIVE_PATHS = {
     "/start", "/dry", "/stop", "/reclaim", "/repair", "/adb", "/takeover",
     "/fight/send", "/fight/send_image", "/fight/grab", "/fight/clear", "/tune",
-    "/tune/reset", "/api/learn",
+    "/tune/reset", "/api/learn", "/follow",
     # ★ 2026-10-12：知识/记忆卡片的写操作（加删记忆、手动跑摘要、开关向量服务）
     "/api/mem/add", "/api/mem/del", "/api/sum/run", "/api/vec",
 }
@@ -92,8 +101,8 @@ def tune_state():
            "slow_window": "", "slow_interval": None,
            "poll_min": 10, "poll_max": 3600, "delay_hi": 600}
     try:
-        if DIR not in sys.path:
-            sys.path.insert(0, DIR)
+        if APPDIR not in sys.path:
+            sys.path.insert(0, APPDIR)
         from wxauto import tuning as T
         from wxauto.config import load_config
         out["poll_min"], out["poll_max"] = int(T.POLL_MIN), int(T.POLL_MAX)
@@ -120,8 +129,8 @@ def tune_state():
 
 def tune_save(body):
     """保存面板上的节奏设定。返回一句人话给用户看；参数非法抛 ValueError。"""
-    if DIR not in sys.path:
-        sys.path.insert(0, DIR)
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
     from wxauto import tuning as T
     data = T.save_tuning(poll_interval=body.get("poll_interval"),
                          delay_min=body.get("delay_min"),
@@ -138,10 +147,45 @@ def tune_save(body):
 
 def tune_reset():
     """删掉 tuning.json → 读屏间隔和回复延迟都回到 config.yaml。"""
-    if DIR not in sys.path:
-        sys.path.insert(0, DIR)
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
     from wxauto import tuning as T
     return T.clear_tuning()
+
+
+# ---------------------------------------------------------------- 特别关注（2026-10-16）
+# 用户要求：「微信机器人增加功能特别关注，按在面板上，机器人看见特别关注的 id
+# 会立即回复」。名单写 data/follow.json，机器人每轮看 mtime 热加载（wxauto/follow.py
+# 负责读写，wxauto/bot.py 的 _is_followed 负责匹配）。
+def follow_state():
+    """面板「⭐ 特别关注」卡片要显示的东西：名单 + 开关。"""
+    out = {"ok": True, "error": "", "enabled": True, "ids": [],
+           "desc": "没有特别关注的人", "max": 200}
+    try:
+        if APPDIR not in sys.path:
+            sys.path.insert(0, APPDIR)
+        from wxauto import follow as F
+        data = F.load_follow()
+        out["enabled"] = bool(data.get("enabled", True))
+        out["ids"] = list(data.get("ids") or [])
+        out["desc"] = F.describe(data)
+        out["max"] = int(F.IDS_MAX)
+    except Exception as exc:
+        out["ok"], out["error"] = False, str(exc)
+    return out
+
+
+def follow_save(body):
+    """保存面板上的特别关注名单。返回一句人话；参数非法抛 ValueError。"""
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
+    from wxauto import follow as F
+    enabled = body.get("enabled", True)
+    data = F.save_follow(body.get("ids"), enabled=enabled)
+    if not data["ids"]:
+        return "名单已清空 —— 不再特别关注任何人"
+    return "已保存：%s（%s）" % (F.describe(data),
+                                "生效中" if data["enabled"] else "已暂停，名单留着不回复")
 
 
 def chat_payload(limit=80):
@@ -171,7 +215,7 @@ def chat_payload(limit=80):
 
 def _sh(args, timeout=180):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=DIR)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=APPDIR)
         return (r.stdout or "") + (r.stderr or "")
     except Exception as exc:
         return "执行失败：%r" % (exc,)
@@ -191,7 +235,7 @@ def _get(url, timeout=4):
 # 2026-10-04 晚用户要求：把原来独立的「演练台」并进「实战台」——
 # 读消息 / 选消息 / 生成 / 换一条 / 改成我想发的话 / 发出去，一个卡片全包。
 # （数据文件 演练台.json / 演练反馈.md / 演练评价.json 保留在原地，只是面板不再用。）
-SIM_SCRIPT = os.path.join(DIR, "simulate.py")
+SIM_SCRIPT = os.path.join(APPDIR, "simulate.py")
 _LOCK = threading.Lock()      # 实战台候选 / 发送记录等共享状态
 
 
@@ -291,9 +335,9 @@ def _gen_reply(text, timeout=200, mention=False, quote=False):
     if quote:
         cmd.append("--quote")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=DIR)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=APPDIR)
     except Exception as exc:
-        return "", "", "%s: %s" % (type(exc).__name__, exc)
+        return "", "", "%s: %s" % (type(exc).__name__, exc), ""
     out = (r.stdout or "").strip().splitlines()
     try:
         d = json.loads(out[-1]) if out else None
@@ -301,7 +345,7 @@ def _gen_reply(text, timeout=200, mention=False, quote=False):
         d = None
     items = (d or {}).get("items") or []
     if not items:
-        return "", "", ((r.stderr or "").strip()[-200:] or "生成失败")
+        return "", "", ((r.stderr or "").strip()[-200:] or "生成失败"), ""
     it = items[0]
     # 第 4 个返回值是**命中的规则名**：面板要靠它把「图片规则」变成真的发图
     # （2026-10-09：原来只返回文本，于是 meitu 规则只能发一句占位说明）。
@@ -419,8 +463,8 @@ def _rule_by_name(name):
     if not name:
         return None
     try:
-        if DIR not in sys.path:
-            sys.path.insert(0, DIR)
+        if APPDIR not in sys.path:
+            sys.path.insert(0, APPDIR)
         from wxauto.config import load_rules
         from wxauto.matcher import Rule
         for d in load_rules():
@@ -457,8 +501,8 @@ def fight_send_image(rule_name="", source="", text="", origin="manual", who="",
         src = str(getattr(r, "meitu_source", "") or "").strip()
     path = ""
     try:
-        if DIR not in sys.path:
-            sys.path.insert(0, DIR)
+        if APPDIR not in sys.path:
+            sys.path.insert(0, APPDIR)
         from wxauto.config import load_config
         cfg = load_config()
         if r is not None and bool(getattr(r, "is_image", False)):
@@ -580,8 +624,8 @@ def fight_send(text, target="", origin="manual", draft="", src="", who="",
 # ⚠️ 2026-10-07：这里原来还有「待审草稿」那条线（机器人窗口外自己写稿、等主人点头），
 #    proactive_window 改成全天之后它永远走不到，已按用户要求删掉（交接说明 §46.8）。
 def _drafts_mod():
-    if DIR not in sys.path:
-        sys.path.insert(0, DIR)
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
     from wxauto import drafts as D
     return D
 
@@ -640,8 +684,8 @@ def learn_state():
 
 def _llm_conf():
     """拿 base_url / key / model（走 wxauto.config + 同目录 .deepseek_key）。"""
-    if DIR not in sys.path:
-        sys.path.insert(0, DIR)
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
     from wxauto.config import load_config
     cfg = load_config()
     llm = getattr(cfg, "llm", None)
@@ -841,7 +885,7 @@ def battery_line():
     now = time.time()
     if _BATT["text"] and now - _BATT["at"] < 30:
         return _BATT["text"]
-    out = _sh(["bash", os.path.join(DIR, "battery_guard.sh"), "--status"], 40) or ""
+    out = _sh(["bash", os.path.join(APPDIR, "battery_guard.sh"), "--status"], 40) or ""
     text = " · ".join(l.strip() for l in out.strip().splitlines() if l.strip())
     _BATT.update(at=now, text=text or "读不到（battery_guard.sh 没响应）")
     return _BATT["text"]
@@ -1031,14 +1075,14 @@ def _busy_wrap(what: str, args, timeout: int):
 
 
 def start(dry: bool):
-    args = ["bash", os.path.join(DIR, "bot.sh"), "start"] + (["--dry-run"] if dry else [])
+    args = ["bash", os.path.join(APPDIR, "bot.sh"), "start"] + (["--dry-run"] if dry else [])
     _busy_wrap("启动（干跑）" if dry else "启动（真跑）", args, 240)
 
 
 def stop():
     # ★ 2026-10-12：带上身份，机器人日志里才看得出是面板点的（见 botpids.sh::_note_stop）
     _busy_wrap("停止", ["env", "WXBOT_STOP_WHO=面板", "WXBOT_STOP_WHY=你在面板上点了「停止」",
-                      "bash", os.path.join(DIR, "bot.sh"), "stop"], 60)
+                      "bash", os.path.join(APPDIR, "bot.sh"), "stop"], 60)
 
 
 def _post_local(url, timeout=90):
@@ -1065,7 +1109,7 @@ def takeover():
         lines.append("① 叫桥接搬：%s" % json.dumps(res, ensure_ascii=False))
         if not res.get("ok"):
             lines.append("② 桥接没通 / 没搬成 → 先把桥接拉起来")
-            lines.append((_sh(["bash", os.path.join(DIR, "wxbridge_ctl.sh"),
+            lines.append((_sh(["bash", os.path.join(APPDIR, "wxbridge_ctl.sh"),
                                "start"], 200) or "").strip()[-300:])
             time.sleep(2)
             res = _post_local("http://127.0.0.1:8765/takeover")
@@ -1095,7 +1139,7 @@ def reclaim_wechat():
         lines.append("① 叫桥接收回：%s" % json.dumps(res, ensure_ascii=False))
         if not res.get("ok"):
             lines.append("② 桥接没通 / 没收回 → 先把桥接拉起来")
-            lines.append((_sh(["bash", os.path.join(DIR, "wxbridge_ctl.sh"),
+            lines.append((_sh(["bash", os.path.join(APPDIR, "wxbridge_ctl.sh"),
                                "start"], 200) or "").strip()[-300:])
             time.sleep(2)
             res = _post_local("http://127.0.0.1:8765/reclaim", timeout=150)
@@ -1109,7 +1153,7 @@ def reclaim_wechat():
 
 def repair():
     """守护 / 微信 / 桥接 一把修 —— recover.sh --no-bot，不碰机器人。"""
-    _busy_wrap("修复连接", ["bash", os.path.join(DIR, "recover.sh"), "--no-bot"], 500)
+    _busy_wrap("修复连接", ["bash", os.path.join(APPDIR, "recover.sh"), "--no-bot"], 500)
 
 
 def reconnect_adb():
@@ -1172,11 +1216,11 @@ def _auto_heal(bad):
             time.sleep(2)
         if "虚拟屏守护" in bad:
             lines.append("② 重启虚拟屏守护 + 桥接（不搬微信）")
-            lines.append((_sh(["bash", os.path.join(DIR, "recover.sh"),
+            lines.append((_sh(["bash", os.path.join(APPDIR, "recover.sh"),
                                "--no-bot", "--no-takeover"], 520) or "").strip()[-400:])
         elif "桥接" in bad:
             lines.append("② 重启桥接服务")
-            lines.append((_sh(["bash", os.path.join(DIR, "wxbridge_ctl.sh"),
+            lines.append((_sh(["bash", os.path.join(APPDIR, "wxbridge_ctl.sh"),
                                "start"], 240) or "").strip()[-300:])
 
         a, v, b = _infra()
@@ -1190,7 +1234,7 @@ def _auto_heal(bad):
                              "不用了之后点一下「启动」就行。")
             else:
                 lines.append("③ 重启机器人")
-                lines.append((_sh(["bash", os.path.join(DIR, "bot.sh"),
+                lines.append((_sh(["bash", os.path.join(APPDIR, "bot.sh"),
                                    "start"], 260) or "").strip()[-220:])
     except Exception as exc:
         lines.append("看护动作异常：%r" % (exc,))
@@ -1269,8 +1313,8 @@ VEC_HEALTH = "http://127.0.0.1:8766/health"
 
 
 def _ensure_path():
-    if DIR not in sys.path:
-        sys.path.insert(0, DIR)
+    if APPDIR not in sys.path:
+        sys.path.insert(0, APPDIR)
 
 
 def vec_status(timeout: float = 2.5) -> dict:
@@ -1390,7 +1434,7 @@ def sum_run() -> dict:
 def vec_op(op: str) -> dict:
     op = "stop" if str(op) == "stop" else "start"
     try:
-        r = subprocess.run(["bash", os.path.join(DIR, "embed_ctl.sh"), op],
+        r = subprocess.run(["bash", os.path.join(APPDIR, "embed_ctl.sh"), op],
                            capture_output=True, text=True, timeout=180)
         lines = [x for x in (r.stdout or "").strip().splitlines() if x.strip()]
         return {"ok": r.returncode == 0, "op": op,
@@ -2151,6 +2195,78 @@ def page():
        st["poll_min"], st["poll_max"], st["delay_hi"], _num_txt(st["dmin"]),
        st["delay_hi"], _num_txt(st["dmax"]), slow_note)
 
+    # 「⭐ 特别关注」——2026-10-16 用户要求：按在面板上，名单上的人一说话
+    # 机器人立即回复。名单填的是**昵称**（机器人读屏只拿得到昵称）。
+    fst = follow_state()
+    if fst["ok"]:
+        fdesc = fst["desc"]
+        fnote = ("<span style=\"color:#0a7d32;font-weight:600\">生效中</span>"
+                 if fst["enabled"] else
+                 "<span style=\"color:#c77700;font-weight:600\">已暂停</span>")
+        ftext = html.escape("\n".join(fst["ids"]))
+        fmax = int(fst.get("max") or 200)
+    else:
+        fdesc = "⚠️ 读不到名单：%s" % html.escape(str(fst["error"]))
+        fnote, ftext, fmax = "—", "", 200
+
+    follow_card = """
+<style>
+ .farea{width:100%%;padding:10px;font-size:16px;border:1px solid #c9c9cf;
+        border-radius:10px;background:#fff;color:#111;box-sizing:border-box;
+        min-height:112px;line-height:1.6;margin-top:9px}
+ .fchk{display:flex;align-items:center;gap:7px;font-size:14px;color:#333;margin-top:10px}
+ .fchk input{width:18px;height:18px}
+</style>
+<div class="card">
+  <div class="k" style="margin-bottom:7px">⭐ 特别关注
+    <span class="chatmeta">（名单上的人一说话，机器人立即回复）</span></div>
+  <div style="font-size:13px;color:#555;line-height:1.7">
+    <b>填 TA 在群里的昵称</b>（机器人读屏只认得昵称，拿不到微信号）；
+    可以只填主名 —— 名单写「张三」，屏上读到「张三（今晚打本）」也认得出。
+    <br>每行一个名字（逗号、顿号也行）。现在：<b>%s</b> · %s
+    <br>·「立即回复」= 这个人说话就当他被 @：不靠关键词、不靠话题打分抽签，直接生成并发出；
+    静默时段 / 最小回复间隔 / 本波连回上限都豁免，<b>但每分钟、每小时、每天的条数上限照旧</b>
+    （防封号底线，跟被 @ 一个待遇）。
+    <br>· 只对机器人待着的那个群生效（见 <code>config.yaml → target.group</code>）。私聊它管不到 ——
+    机器人只在群里读屏。
+    <br>· 存 <code>data/follow.json</code>，保存后最迟一轮读屏生效，不用重启机器人；
+    删掉这个文件就等于取消全部特别关注。
+  </div>
+  <textarea id="followIds" class="farea" placeholder="张三&#10;李四">%s</textarea>
+  <div class="fchk">
+    <input type="checkbox" id="followOn"%s>
+    <label for="followOn">生效（取消勾选 = 名单留着，但不回复）</label>
+  </div>
+  <button class="tbtn" id="followSave">保存名单</button>
+  <div class="chatempty" id="followmsg" style="margin-top:7px">
+    名单最多 %d 人。名字写错不会报错，只是匹配不上 —— 以机器人实际读到的昵称为准；
+    把名字全删掉保存 = 取消全部特别关注。
+  </div>
+</div>
+<script>
+(function(){
+  function post(path, body){
+    return fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                        body: JSON.stringify(body || {})}).then(function(r){ return r.json(); });
+  }
+  var btn = document.getElementById('followSave');
+  if (!btn) return;
+  var msg = document.getElementById('followmsg');
+  btn.addEventListener('click', function(){
+    var on = document.getElementById('followOn');
+    var box = document.getElementById('followIds');
+    if (!box.value.trim() && !confirm('名单是空的 —— 保存后会取消全部特别关注，确定？')) return;
+    msg.textContent = '保存中…';
+    post('/follow', {ids: box.value,
+                     enabled: !on || on.checked}).then(function(r){
+      msg.textContent = r.ok ? ('✅ ' + r.msg + '（最迟一轮读屏生效）')
+                             : ('⚠️ ' + (r.error || '保存失败'));
+    }).catch(function(){ msg.textContent = '⚠️ 面板连不上，稍后再试'; });
+  });
+})();
+</script>
+""" % (fdesc, fnote, ftext, " checked" if fst["enabled"] else "", fmax)
+
     return """<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2289,7 +2405,7 @@ def page():
         last_html,
         watch_html,
         # ★ 实战台 + 调参 + 知识记忆：按用户要求**放到按钮后面**
-        fight_card + tune_card + know_card,
+        fight_card + tune_card + follow_card + know_card,
         html.escape(log_tail()), PORT, 1 if busy else 0)
 
 
@@ -2505,6 +2621,13 @@ class H(BaseHTTPRequestHandler):
                 self._json({"ok": True,
                             "msg": "已恢复 config.yaml 的默认节奏" if done
                                    else "本来就没设过（一直是 config.yaml 的值）"})
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)})
+        # ---- 特别关注名单：写 data/follow.json，机器人下一轮热加载（不用重启）----
+        elif p == "/follow":
+            b = self._body()
+            try:
+                self._json({"ok": True, "msg": follow_save(b)})
             except Exception as exc:
                 self._json({"ok": False, "error": str(exc)})
         else:

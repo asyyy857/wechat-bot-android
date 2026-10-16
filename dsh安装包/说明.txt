@@ -1,0 +1,35 @@
+这个目录里是本发布包附带的两样东西（不是微信机器人本身，是它依赖的环境件）。
+
+1) Tdsh-0.2.8.3.apk  ——  DSH（手机上的 Linux 容器 App）
+   · 装法：把它传到手机（或直接在手机文件管理器里点开），按提示安装；
+     系统会问「是否允许安装未知来源应用」，允许即可。
+   · 装完打开 DSH 并授予「文件/存储」权限，它才会创建 /sdcard/dsh 工作区。
+   · 详细步骤见包顶层《新手安装攻略-从零开始.md》第 2 节。
+   · ⚠️ 本 APK 由第三方提供，请自行确认来源可信；本项目与 DSH 的开发者没有关联。
+
+2) dsh-vscreen-1.1.0.tgz  ——  DSH 的「虚拟屏」插件（v1.1.0）
+   · 它给 DSH 增加 vscreen 相关能力（读虚拟屏画面、点击、滑动等），本项目用它
+     把微信/游戏跑到一块后台虚拟屏上，不占用你正在看的主屏。
+   · 装法（二选一，按你的 DSH 版本哪种能用就用哪种）：
+     A. 在 DSH 的命令行里执行（把路径换成你的实际解压位置）：
+          dsh plugin add /sdcard/dsh/微信机器人-v2.1.3/dsh安装包/dsh-vscreen-1.1.0.tgz
+     B. 手动装（A 报错、或装完工具没出现时用）：
+        把 dsh-vscreen-1.1.0.tgz 拷到 /root/.dsh/profiles/web/ 下，
+        在同一个目录的 package.json 里：
+          · dependencies 里加一行   "dsh-vscreen": "file:./dsh-vscreen-1.1.0.tgz"
+          · dsh.profile.bundles 里加上一项  "dsh-vscreen"
+        然后重启 DSH。
+   · ⚠️ 两个已知坑：
+     ① 插件的端口默认写死 18240/18242，而本项目的守护实际用 18250/18252；
+        对不上就用包内脚本改：sh /sdcard/dsh/tools/fix-vscreen-ports.sh
+        （install.sh 会把它装到 /sdcard/dsh/tools/）；
+     ② 某些 DSH 版本跑 `dsh plugin add` 会漏拷插件包里的文件，装完最好用
+        `dsh plugin list` 或 `dsh --profile web --dump-config` 复查一眼。
+   · 真正「建虚拟屏」的程序是 vscreen-daemon（本包 payload 里，install.sh 会装到
+     /sdcard/dsh/vscreen-daemon/ 并可用 start.sh 启动）；这个插件只是把操作入口
+     接给 DSH，两者要配套。
+
+3) 顺便说一句，本发布包顶层还有两份值得一读的文档：
+   · 《新手安装攻略-从零开始.md》—— 从装 DSH 到机器人跑起来的完整步骤（新手向）；
+   · 《受信任虚拟屏自动化后台运行-v1.1.md》—— 虚拟屏这套东西的原理与重建步骤，
+     文末自带全部源码；想搞懂「为什么不占你的主屏」就看它。

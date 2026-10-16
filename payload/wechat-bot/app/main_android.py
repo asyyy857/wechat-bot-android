@@ -100,7 +100,7 @@ def cmd_check_llm(bot) -> int:
     from wxauto.reader import Block, Message, Snapshot
     fake = Snapshot(chat_title="(测试)", width=636, height=1400, messages=[])
     msg = Message(blocks=[Block("有人打洲嘛", 140, 900, 200, 30)], is_self=False,
-                  sender="糕手小王碎")
+                  sender="张三")
     fake.messages = [msg]
     t0 = time.time()
     out = bot.brain.compose(fake, msg, "有人@你")

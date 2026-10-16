@@ -25,7 +25,10 @@ from .netutil import fetch_hard
 URL = os.environ.get("EMBED_URL", "http://127.0.0.1:8766")
 _health = {"ok": None, "at": 0.0}
 
-DEFAULT_MIN = 0.55          # 相似度低于它算不相关（实测相关 ≥0.70、无关 ≤0.45）
+DEFAULT_MIN = 0.45          # 相似度低于它算不相关
+                            # ★ 2026-10-15：0.55 → 0.45。本机 bge-small-zh 实测
+                            #   相关 0.44~0.56、无关 ≤0.41（config 里 memory.vector_min
+                            #   也同步改了；这个只是没配 config 时的兜底值）。
 
 
 def available(ttl: float = 60.0) -> bool:

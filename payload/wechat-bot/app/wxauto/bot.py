@@ -31,6 +31,7 @@ from .chatlog import ChatLog
 from .config import ROOT, load_config, load_persona, load_personas, load_rules
 from .paths import LOGS_DIR
 from .governor import Governor
+from . import imgutil
 from .matcher import Matcher, Rule
 from .meitu import MeituFetcher
 from .reader import Message, PcReader, Snapshot, normalize
@@ -41,6 +42,7 @@ from .state import State
 from .stickers import StickerLibrary
 from . import drafts
 from . import tuning as tune
+from . import follow as follow_mod
 from .watchdog import StallWatchdog
 
 # ★ 2026-10-05：主动插话的概率是否随话题分数放大（见 reply 流程里那段注释）。
@@ -123,6 +125,14 @@ _IMAGE_ASK_WORDS = ("看图", "看看图", "图片", "照片", "相片", "截图
 #   会**替主人点屏幕**（桥接 /read_record 要单击卡片、进详情页、再退出来），
 #   不能因为他在群里随口提一句"聊天记录"就去点。
 _RECORD_WORDS = ("聊天记录", "聊天纪录", "转发记录", "记录合集", "记录里")
+# ★ 2026-10-15（用户原话：「我要的是读张三的消息」）：他说的既不是"图片"也不是
+#   "聊天记录" —— `_looks_like_image_request` 只认图片词、`_RECORD_WORDS` 只认聊天
+#   记录，于是"读一下 XX 的消息"**两头都不沾**，最后只当普通聊天回了。
+#   下面两个词表配 `_image_target_sender`（必须**真点了名**）一起用，三个都中才算。
+_READ_ACTS = ("读一下", "读读", "读一读", "念一下", "看一下", "看看", "看下",
+              "总结", "说说", "讲讲", "翻译", "讲讲看")
+_READ_OBJECTS = ("消息", "内容", "那条", "这条", "发的", "图", "照片", "截图",
+                 "卡片", "文章", "链接", "记录", "说了")
 # ★ 2026-10-10（用户口径：「补读只在我叫的时候翻」）：主人喊它**往回翻补读**的词表。
 #   动机：群里爆发时一屏只有 11 条，间隔里刷过去的消息从来没上过屏（见交接说明续30/32）。
 #   两个词表都中才动手 —— 这一步会**滚他的屏幕**（虽然翻完一定切回最新），
@@ -347,8 +357,16 @@ class Bot:
         # 「识别到消息之后等几秒再发」，而且**不想每次重启机器人**。
         # 这两个值放在 tuning.json 里（面板写、这里每轮读），config.yaml 只当
         # 出厂默认值 —— tuning.json 里没写的项就回落到 config.yaml 的值。
+        # ---- 特别关注名单（控制面板上的「⭐ 特别关注」卡片）----
+        # 2026-10-16 用户要求：名单上的人一说话就**立即回复**（不靠被 @、
+        # 不靠主动开口打分抽签）。面板写 follow.json，这里每轮看 mtime 重载。
+        self._follow_path = ROOT / "follow.json"
+        self._follow_mtime = _mtime(self._follow_path)
+        self._follow = follow_mod.load_follow(self._follow_path)
+
         self._tuning_path = ROOT / "tuning.json"
         self._tuning_mtime = _mtime(self._tuning_path)
+        self._tuning_seen = None       # "已经套用的那一份内容"（★ 2026-10-16，见上面的说明）
         self._pace_orig = tune.snapshot_pace(self.cfg)
         self._apply_tuning(quiet=True)      # 启动时先套一次（面板可能已经设过）
 
@@ -453,6 +471,14 @@ class Bot:
         self._img_seen = State()
         # 机器人自己上一次**发出图片**的时间（见 _send_sticker / _send_meitu）
         self._img_self_sent_at = 0.0
+        # ★ 2026-10-15：机器人自己发出去的图片指纹（aHash）。读屏偶尔会把自己发的
+        #   图片气泡判成"别人发的"（见 imgutil 的模块说明），上面那个时间戳兜不住
+        #   —— 用户点名要读的那张，可能就在机器人几分钟前发的表情包旁边。发图成功时
+        #   记下原图指纹，被叫看图时比对，见 _is_my_image / _nearby_image。
+        #   这个列表**落盘**（my_images.json）—— 重启后屏上那张表情包还在，
+        #   内存一清就又认不出来了（2026-10-15 用户报的正是重启前后这一类）。
+        self._my_images = self._load_my_images()   # 从磁盘恢复（见 _load_my_images）
+        self._stock_hashes_cache = None   # 表情包库指纹（懒加载，见 _stock_hashes）
 
     # ------------------------------------------------------------ 热重载
     def _apply_tuning(self, quiet: bool = False) -> dict:
@@ -467,6 +493,12 @@ class Bot:
         except Exception as exc:
             self.log.error(f"应用 tuning.json 失败（继续用旧节奏）：{exc}")
             return {}
+        # ★ 2026-10-16：记下"这一份内容已经套用过了" —— 热重载改成**比内容**，
+        #   不再看 mtime（原因见 reload_if_changed 里那段）。
+        try:
+            self._tuning_seen = tune.load_tuning(self._tuning_path)
+        except Exception:
+            self._tuning_seen = getattr(self, "_tuning_seen", None)
         if "reply_delay" in applied:
             # human_delay() 读的是调速器自己的副本，得同步过去，否则只改了配置不生效
             self.governor.reply_delay = applied["reply_delay"]
@@ -539,10 +571,36 @@ class Bot:
         # 运行时调参（面板上的「读屏节奏」）：文件一变就套用，**不用重启机器人**。
         # 删掉 tuning.json 时 mtime 变回 0.0，同样会触发 —— 于是自动回落到
         # config.yaml 的值（_apply_tuning 里用 _pace_orig 兜底）。
-        m = _mtime(self._tuning_path)
-        if m != self._tuning_mtime:
-            self._tuning_mtime = m
-            self._apply_tuning()
+        # ★★ 2026-10-16（真 bug，实测抓出来的）：**不能用 mtime 判断改动**。
+        #   `/sdcard` 是 FUSE（sdcardfs），`save_tuning` / `save_follow` 那套
+        #   「临时文件写完 → os.replace」在这里**不更新目标文件的 mtime**
+        #   （实测：内容从 {poll:20} 改成别的，`stat` 时间戳纹丝不动）——
+        #   于是"面板改完 → 机器人热加载"整条路**静默失效**，tuning.json 从
+        #   2026-10-13 起就没再被检测到过。改成**每轮直接读文件比内容**：
+        #   这些都是几百字节的小 JSON，比一次 OCR 便宜好几个数量级。
+        try:
+            if tune.load_tuning(self._tuning_path) != self._tuning_seen:
+                self._apply_tuning()
+        except Exception as exc:
+            self.log.warning("检查 tuning.json 改动出错：%r" % (exc,))
+
+        # 特别关注名单（面板上的「⭐ 特别关注」）：变了就重载，不用重启机器人。
+        # 同样是**比内容**（理由见上面 tuning 那段）；失败不推进基线，下一轮重试。
+        try:
+            data = follow_mod.load_follow(self._follow_path)
+        except Exception as exc:
+            self.log.error(f"重载 follow.json 失败（下轮重试，继续用旧的）：{exc}")
+        else:
+            if data != (self._follow or {}):
+                self._follow = data
+                self._follow_mtime = _mtime(self._follow_path)
+                if data.get("ids"):
+                    self.log.info("检测到特别关注名单改动 → %s（立即回复：%s）"
+                                  % (follow_mod.describe(data),
+                                     "开" if data.get("enabled", True) else "关"))
+                else:
+                    self.log.info("检测到特别关注名单改动 → 名单为空"
+                                  "（不再特别关注任何人）")
 
     # ------------------------------------------------------------ 发送自检
     def _verify_sent(self, text: str) -> bool:
@@ -1089,13 +1147,18 @@ class Bot:
         """
         try:
             kind = str(it.get("kind") or "sticker")
-            name = os.path.basename(str(it.get("path") or ""))
+            path = str(it.get("path") or "")
+            name = os.path.basename(path)
             # ★ 先记最关键的这两样：读屏层把自己发的图判成"别人发的"，机器人就会
             #   对着自己的图再回一次（`_mine_said` 存在的全部意义）。
             self._mine_said.append((time.time(), normalize("[图片]")))
             self._img_self_sent_at = time.time()
-            # 配额/熔断是次要的：出错也不该把上面那两样一起带走
+            # 配额/熔断是次要的：出错也不该把上面那两样一起带走。
+            # ★ 2026-10-16：`_remember_my_image` 原来摆在这层 try **外面** ——
+            #   它一抛（`path` 当时还没定义，见上）就把下面的配额/熔断一起吞了，
+            #   而且只在日志留一句"记账出错"。现在跟配额同一组，各自互不牵连。
             try:
+                self._remember_my_image(path)   # ★ 记住这张是我发的（见 _is_my_image）
                 self.breaker.record_success()
                 self.governor.record()
                 rn = str(it.get("rule_name") or "")
@@ -1201,6 +1264,7 @@ class Bot:
             #   `_mine_said` 兜着，图片没有可比的文本 —— 用这个时间戳兜：
             #   发图后的一小段时间里，屏幕上的图片消息一律不当"群友发的照片"。
             self._img_self_sent_at = time.time()
+            self._remember_my_image(path)      # ★ 记住这张是我发的（见 _is_my_image）
             return True
 
         self.log.warning("本次发图判定为失败")
@@ -1310,6 +1374,7 @@ class Bot:
             #   `_mine_said` 兜着，图片没有可比的文本 —— 用这个时间戳兜：
             #   发图后的一小段时间里，屏幕上的图片消息一律不当"群友发的照片"。
             self._img_self_sent_at = time.time()
+            self._remember_my_image(path)      # ★ 记住这张是我发的（见 _is_my_image）
             # 配文（规则里配了 replies 就有）：★ 只在这里发，因为**图已经成功**了
             if captions:
                 self._send_caption_after_image(captions, reason)
@@ -1733,10 +1798,13 @@ class Bot:
 
         为什么要分片睡：用户如果把读屏间隔拧到 1 小时（上限就是 3600 秒），
         再想拧回 10 秒，一整轮 sleep 可能正好睡在那一小时里 —— 得等满一小时
-        改动才生效。这里每 2 秒醒一次看一眼调参文件的 mtime，变了就提前返回，
+        改动才生效。这里每 2 秒醒一次看一眼调参文件，变了就提前返回，
         下一轮顶部的 reload_if_changed() 会把新节奏套上。
 
-        额外开销：每 2 秒一次 stat（比一次 OCR 便宜 5 个数量级），可忽略。
+        ★ 2026-10-16：判据从 mtime 改成**读文件比内容** —— /sdcard 的 FUSE
+        在 os.replace 之后不更新 mtime（实测），原来那句 `_mtime(...) !=
+        self._tuning_mtime` 永远不成立，"改完 2 秒生效"实际上要等本轮睡满。
+        额外开销：每 2 秒读一个几百字节的 JSON（比一次 OCR 便宜 5 个数量级）。
         """
         end = time.time() + max(0.0, seconds)
         last_peek = time.time()
@@ -1747,7 +1815,8 @@ class Bot:
                 return
             time.sleep(min(2.0, remain))
             try:
-                if _mtime(self._tuning_path) != self._tuning_mtime:
+                if tune.load_tuning(self._tuning_path) != getattr(
+                        self, "_tuning_seen", None):
                     self.log.info("调参文件有改动，提前结束本轮等待并重算读屏节奏")
                     return
             except Exception:
@@ -2037,8 +2106,8 @@ class Bot:
         #   而"他喊它的名字"是明确的对话邀请，不是自言自语。
         #
         #   三道闸门保证它不会变成刷屏机器：
-        #     ① 只有消息里出现"在叫它"的称呼才走（`brain.is_mention`：昵称 / 小AI /
-        #        你昵称的 OCR 误读变体 …；比较是大小写不敏感的），普通话照旧只跑规则；
+        #     ① 只有消息里出现"在叫它"的称呼才走（`brain.is_mention`：配置里填的昵称
+        #        及其 OCR 错读变体 …；比较是大小写不敏感的），普通话照旧只跑规则；
         #     ② 走"被 @"同一条档位（`mention=True`：豁免 min_reply_gap / burst_limit /
         #        静默时段，但 per_minute / per_hour / per_day **一条都不放**）；
         #     ③ ★ **防自触发**：模型写出来的话如果**又带上了那个称呼**，就换一条重写；
@@ -2065,8 +2134,22 @@ class Bot:
             #   现在收成他 10-10 自己说过的那个口径：「**被艾特让看看图的时候识图**」
             #   ——只有这句话确实在说图（`_look`）才去找图、才识图；其余一律先办事/聊天。
             #   ⚠️ 别再退回"有图就识图"：群聊里图是常态，那等于把办事请求全抢走。
-            _look = self._looks_like_image_request(text)
-            img = self._nearby_image(snap, msg, allow_self=True) if _look else None
+            _look = (self._looks_like_image_request(text)
+                     # ★ 2026-10-15：「读一下张三的**消息**」也要算（见那个方法）
+                     or self._looks_like_read_target_request(text, snap))
+            # ★ 2026-10-15：用户点名了谁，就优先找谁发的图（"读一下张三的图片"）
+            _want = self._image_target_sender(text, snap) if _look else ""
+            img = (self._nearby_image(snap, msg, allow_self=True,
+                                      want_sender=_want) if _look else None)
+            if _look and img is None:
+                # ★ 2026-10-15：本屏没有 → 往上翻屏找（用户：「需要翻屏幕」）
+                img = self._scroll_back_for_image(snap, _want)
+            # ★ 2026-10-15：本屏 + 翻屏都没有图 → 试着点开那条消息读（转发图文卡片
+            #   这类"读屏层只给碎片文字"的东西，视觉模型没图可看）
+            if _look and img is None and self._read_card_and_comment(text, snap, _want):
+                return True
+            if _look and img is not None:
+                img = self._maybe_zoom(img)      # ★ 点开放大再读（见 _maybe_zoom）
             # ★ 2026-10-10（用户要求「想个法子让他能读到聊天记录里的内容」）：
             #   主人叫它「读一下这个聊天记录」→ 点开屏幕上那张转发卡片、整页 OCR、
             #   按人设点评发群。
@@ -2095,12 +2178,15 @@ class Bot:
                     got = None
                     self.log.warning("识图异常：%s: %s" % (type(exc).__name__, exc))
                 if got:
-                    # 跟下面 compose 那条路同一条规矩：回复里**不许再出现称呼**，
-                    # 否则机器人自己的话会把自己再叫一遍（续12 的防自触发）。
-                    if not self.brain.is_mention(got):
-                        return self._reply(got, tag + "（看图）", mention=True,
-                                           max_chars=_mc)
-                    self.log.info("识图回复里又出现了称呼，丢弃这一条：%s" % got)
+                    # ★ 2026-10-13：原来这里"带称呼就整条丢弃"（跟下面 compose 同一条
+                    #   旧规矩）。现在改成**照发** —— 理由同下面那段长注释（人设名本身
+                    #   就是触发词，丢弃等于"叫它看图却不理"）；防自触发交给
+                    #   `_is_my_echo`。识图回复很少提名字，这里主要是兜底一致性。
+                    if self.brain.is_mention(got):
+                        self.log.info("识图回复里带了称呼，仍照发（防自触发交给 "
+                                      "_is_my_echo）：%s" % got)
+                    return self._reply(got, tag + "（看图）", mention=True,
+                                       max_chars=_mc)
                 else:
                     self.log.info("识图没给出内容，退回普通回复")
             # ★ 2026-10-09（用户要求）：「我想让这个机器人更智能一点，可以让它帮我
@@ -2126,16 +2212,36 @@ class Bot:
             _tool = self._pick_tool(text)
             if _tool != "self" and self._run_tool(_tool, text):
                 return True
+            _last = ""
             for attempt in (1, 2):
-                reply = self.brain.compose(snap, msg, "主人自己在群里叫它",
+                # ★ 2026-10-13：第 2 次把"别出现称呼"**直接写进 prompt**。
+                #   原来只是原样重写一次，措辞没变、模型多半再写一遍同样的名字
+                #   （实测两条都被毙）。
+                _reason = "主人自己在群里叫它" if attempt == 1 else (
+                    "主人自己在群里叫它。⚠️ 这条回复里**不要出现**主人的昵称、"
+                    "「猫娘」「小猫娘」「小猫」这些字（用「你」或「本喵」代替），"
+                    "否则机器人自己的话会把自己再叫一遍")
+                reply = self.brain.compose(snap, msg, _reason,
                                            max_tokens=_mt, max_chars=_mc,
                                            expand=bool(_mc), own_ask=True)
                 if not reply:
                     break
                 if not self.brain.is_mention(reply):
                     return self._reply(reply, tag, mention=True, max_chars=_mc)
+                _last = reply
                 self.log.info(f"回复里又出现了称呼（第{attempt}次），"
                               f"换一条重写：{reply}")
+            # ★ 2026-10-13（用户报「@ 了它没回」）：两次都避不开称呼时**照发**，
+            #   不再整条丢弃。原口径见本方法开头 ③（"机器人发出去的文本里永远不含
+            #   触发词"）—— 本意是防自触发，但它没算到**人设名（猫娘）和对主人的
+            #   称呼（主人昵称）本身就是触发词**：一句「小猫娘你是什么模型」必然让模型
+            #   说出名字，于是两条回复先后被毙、最后干脆不发（bot.log 12:36:43~
+            #   12:36:45），用户看到的就是"@ 了它不理"。防自触发现在由 `_is_my_echo`
+            #   兜着（全等 / 包含 / 汉字字袋；自己刚发的话一定在 `_mine_said` 里），
+            #   宁可回一句带名字的话，也不要静默装死。
+            if _last:
+                self.log.info(f"两次都带称呼，照发（防自触发交给 _is_my_echo）：{_last}")
+                return self._reply(_last, tag, mention=True, max_chars=_mc)
             self.log.info(f"你叫了它，但没生成出能发的回复：{text}")
             return False
 
@@ -2326,7 +2432,7 @@ class Bot:
         ★ 2026-10-12：规则写了 `mention_ok: true` 的**不让位** —— 这是给
         「看看腿 / 看看腹肌 / 今日美图」这类**动作指令**开的口子。背景：群里习惯
         每次都带 @，而 2026-10-09 的"被 @ 以整句为主"判据会把关键词让给模型 ——
-        实测 23:11 那条 `@我（群昵称）看看腿`（读屏**读全了**）只回了句
+        实测 23:11 那条 `@主人昵称（艾特我召唤猫娘）看看腿`（读屏**读全了**）只回了句
         「拿竞价区给本喵看腿…」，**图没发**，也就是说这个功能在群里等于失效。
         其余规则维持原口径（整句不"全是关键词"就让位，见 `_keyword_is_whole`）。
         """
@@ -2379,6 +2485,16 @@ class Bot:
 
         behavior = self.cfg.behavior
         mentioned = self.brain.is_mention(text)
+        # ★ 2026-10-16 用户要求：「机器人看见特别关注的 id 会立即回复」。
+        #   名单上的人说话 = 被 @ 一个待遇：跳过"关键词才回 / 话题打分抽签"，
+        #   直接走模型生成；节流层按 mention=True（豁免静默时段 / 最小间隔 /
+        #   本波连回上限），条数配额照记（防刷屏底线，同 @ 的处理）。
+        followed = False
+        if not mentioned and self._is_followed(getattr(msg, "sender", "")):
+            followed = True
+            mentioned = True
+            self.log.info("特别关注的人说话 → 立即回复 ← %s：%s"
+                          % (msg.sender, text[:40]))
         hard_block = self.brain.should_skip(text, hard=True)
         # ★ 2026-10-08 审查修复（S2）：硬避雷词原来**只挡 @ 那条路**（判断写在
         #   下面的 @我 分支里），关键词规则完全不看它 —— 于是"借钱/投资/政治"
@@ -2390,7 +2506,7 @@ class Bot:
 
         # 1) 关键词 —— 模板回复，0 Token
         #    被 @ 时跳过"泛化"关键词（问号 / 6 / 恋 这类），
-        #    否则别人问"@你 你觉得呢？"会被"问号"规则抢走，回一个"？"。
+        #    否则别人问"@主人昵称 你觉得呢？"会被"问号"规则抢走，回一个"？"。
         if bool(getattr(behavior, "reply_on_keyword", True)):
             skip = (lambda r: r.mention_exempt) if mentioned else None
             rule = self.matcher.match(text, skip=skip)
@@ -2427,9 +2543,11 @@ class Bot:
                                            rule.name, no_meow=bool(rule.no_meow),
                                            mention=mentioned)
 
-        # 2) 有人在叫我 —— 必回，走模型
+        # 2) 有人在叫我（含「特别关注」的人说话）—— 必回，走模型
         #    （硬避雷已在 handle 开头一刀切掉，这里不再重复判断）
         if bool(getattr(behavior, "reply_on_mention", True)) and mentioned:
+            # 日志和拒稿来源要能分清"被 @"和"特别关注"（同一条路，两个入口）
+            _why = "特别关注" if followed else "@我"
             # ★ 2026-10-09 用户要求：「被艾特的时候……一句话概括的话，他说的很没意思，
             #   你得展开讲讲，他才有意思，才能聊得下去，而不是一句话敷衍」。
             #   ⚠️ 这条路原来有**四道墙**同时卡着，只松一道没用：
@@ -2446,7 +2564,19 @@ class Bot:
             # ★ 2026-10-10（用户口径：「被艾特让看看图的时候识图」）：有人 @ 它、
             #   旁边又有一张图 → **看图回答**，而不是干巴巴接一句文字（那会答非所问：
             #   人家问的是"这张图咋样"）。图拿不到 / 模型没给出内容时才退回普通回复。
-            img = self._nearby_image(snap, msg)
+            _look = self._looks_like_image_request(text)
+            _want = self._image_target_sender(text, snap) if _look else ""
+            img = self._nearby_image(snap, msg, want_sender=_want)
+            if _look and img is None:
+                # ★ 2026-10-15：被 @ 让看图、本屏却没有 → 往上翻屏找
+                img = self._scroll_back_for_image(snap, _want)
+            # ★ 2026-10-15：被 @ 时也认卡片，但**必须点了名**（"读一下 XXX 的图/消息"）
+            #   —— 替用户在群里点屏幕这件事，不能因为随便一句 @ 就触发
+            if (_look and img is None and _want
+                    and self._read_card_and_comment(text, snap, _want)):
+                return True
+            if _look and img is not None:
+                img = self._maybe_zoom(img)      # ★ 点开放大再读（见 _maybe_zoom）
             if img is not None:
                 self.log.info("被 @ 的时候旁边有图（%dx%d），识图回答…"
                               % (int(img.img_w or 0), int(img.img_h or 0)))
@@ -2460,20 +2590,25 @@ class Bot:
                     got = None
                     self.log.warning("识图异常：%s: %s" % (type(exc).__name__, exc))
                 if got:
-                    return self._reply(got, f"@我+图：{text}", mention=True,
+                    return self._reply(got, f"{_why}+图：{text}", mention=True,
                                        max_chars=_mc)
                 self.log.info("识图没给出内容，退回普通回复")
-            reply = self.brain.compose(snap, msg, "有人@你", max_tokens=_mt,
-                                       max_chars=_mc, expand=bool(_mc))
+            reply = self.brain.compose(
+                snap, msg, ("特别关注的人说话" if followed else "有人@你"),
+                max_tokens=_mt, max_chars=_mc, expand=bool(_mc))
             if reply:
-                return self._reply(reply, f"@我：{text}", mention=True,
+                return self._reply(reply, f"{_why}：{text}", mention=True,
                                    max_chars=_mc)
-            self.log.info(f"@我但模型没给出回复：{text}")
+            self.log.info(f"{_why}但模型没给出回复：{text}")
             return False
 
         # 3) 主动开口 —— 本地打分够了才动用模型。这里分两条路（2026-10-05）：
         #    · 深夜（pace.proactive_window，默认 00:00-07:00）= 直接发（原行为，用户选了保留）
         #    · 白天 = **只备稿**，塞进待审队列等主人点头，一个字都不发
+        # ★ 2026-10-15：读屏把图上的小字读出来的"垃圾串"不要拿来接话（见那个方法）
+        if self._looks_like_ocr_garbage(text, snap, msg):
+            self.log.info("这条像是读屏读出来的碎片（%r…），不接话" % text[:16])
+            return False
         if self.brain.available:
             skip = self.brain.should_skip(text, hard=False)
             if skip:
@@ -2698,6 +2833,63 @@ class Bot:
         self.log.info("读完聊天记录但没生成出能发的点评：%s" % text)
         return True
 
+    def _read_card_and_comment(self, text, snap, want_sender: str = "",
+                               max_chars: int = 0) -> bool:
+        """被叫看图、可屏幕上没有图可看 → **点开那条消息**整页 OCR。
+
+        ★ 2026-10-15（用户：「读一下张三的图片」）：那张其实是**转发的微博图文
+          卡片** —— 读屏层把它读成一堆碎片文字（「@怪我笨图文 / 3.6万 / #…」），
+          视觉模型根本没有图可看。用户选了「加，并且顺手也认聊天记录以外的卡片」，
+          于是这里点开它（桥接 ``/read_card`` 按昵称定位那块 → 点一次 → 整页 OCR →
+          立刻退回），再把读到的正文交给模型点评。
+
+        返回 True = 这条指令处理掉了（读成功并回了话）；False = 没读成 ——
+        交给调用方继续走普通回复，**不再多发一句"没读到"**：用户要的是内容，
+        不是一条错误提示（而且看图失败本来就会退回正常聊天）。
+        """
+        rcfg = getattr(self.cfg, "record", None)
+        if rcfg is not None and not bool(getattr(rcfg, "enabled", True)):
+            return False
+        rc = getattr(self.sender, "read_card", None)
+        if not callable(rc):
+            return False
+        who = want_sender or "群友"
+        self.log.info("本屏没有图可看 → 点开「%s」发的那条读一读（约 20~30 秒）" % who)
+        self._hud_note("机器人在读那条消息",
+                       "点开「%s」发的卡片 → 整页 OCR → 读完自动退回" % who)
+        try:
+            got = rc(sender=want_sender)
+        except Exception as exc:
+            self.log.warning("读卡片异常：%s: %s" % (type(exc).__name__, exc))
+            got = None
+        if not got:
+            err = str(getattr(self.sender, "last_record_error", "") or "读不到")
+            self.log.info("读卡片失败（%s）→ 这条走普通回复" % err)
+            return False
+        title = str(got.get("title") or who)
+        content = str(got.get("text") or "")
+        self.log.info("读到卡片 %r：%d 字" % (title, len(content)))
+        try:
+            self._save_record(title, content)
+        except Exception as exc:
+            self.log.warning("存卡片原文失败：%s" % exc)
+        if not content.strip():
+            return False
+        limit = int(max_chars
+                    or getattr(rcfg, "reply_max_chars", 0)
+                    or getattr(self.cfg.behavior, "max_reply_chars", 40))
+        cmt = None
+        try:
+            cmt = self.brain.comment_on_record(title, content, snap=snap,
+                                               max_reply=limit)
+        except Exception as exc:
+            self.log.warning("点评卡片异常：%s: %s" % (type(exc).__name__, exc))
+        if cmt and not self.brain.is_mention(cmt):
+            return self._reply(cmt, "读完卡片点评：" + text,
+                               mention=True, max_chars=limit)
+        self.log.info("读完卡片但没生成出能发的点评：%s" % text)
+        return True
+
     def _save_record(self, title: str, content: str) -> str:
         """把读到的原文存一份（纯文本，事后能核查它到底读到了什么）。"""
         os.makedirs(RECORD_ARCHIVE_DIR, exist_ok=True)
@@ -2784,13 +2976,41 @@ class Bot:
         t = normalize(text or "")
         return any(w in t for w in _IMAGE_ASK_WORDS)
 
-    def _nearby_image(self, snap, anchor, allow_self: bool = False):
+    def _looks_like_read_target_request(self, text, snap) -> bool:
+        """「读一下张三的消息」这种 —— 点名了某人 + 读取动作 + 要看的东西。
+
+        ★ 2026-10-15（用户原话：「我要的是读张三的消息」）：他说的是"消息"，不是
+          "图片"、也不是"聊天记录" —— 原来那两条判定都不沾边，最后只当普通聊天回了。
+        判据要**三个都中**：
+          ① 屏幕上真出现过这个昵称（`_image_target_sender` 认得出来）；
+          ② 有读取动作词（读一下 / 看看 / 总结…）；
+          ③ 有"要看的东西"这类词（消息 / 内容 / 那条 / 图 / 卡片…）。
+        只要没点名就一律不算 —— 这条路会**替用户点屏幕**（`_read_card_and_comment`），
+        宁可少做一次，也不能因为群里随口一句话就去点。
+        """
+        if not self._image_target_sender(text, snap):
+            return False
+        t = normalize(text or "")
+        if not any(w in t for w in _READ_ACTS):
+            return False
+        return any(w in t for w in _READ_OBJECTS)
+
+    def _nearby_image(self, snap, anchor, allow_self: bool = False,
+                      want_sender: str = "", span: int = 12):
         """找「这条消息旁边那张图」—— 有人 @ 它让它看图时用。
 
-        ★ 2026-10-10 用户改的口径：**主动识图关掉，改成"被 @ 让看图的时侯才识图"**。
-        微信里 @ 和图片是**两条独立的消息**，所以只能按位置找：先看 @ 之后
-        （「@你 看看这张」然后发图，最常见），再看 @ 之前一格
-        （先把图甩出来再 @ 也常见）。前后各看 2 条，再远就不是同一个回合了。
+        ★ 2026-10-15 重写（用户报「我让它读张三的图片，它却读了自己的表情包」）。
+        老逻辑有两个洞：
+          ① **只前后各看 2 条** —— 群里刷得快，用户点名的那张往往在更上面
+             （这次那张在第 6 条），压根没进候选；
+          ② **谁近谁赢** —— 离 @ 最近的那张正好是机器人自己刚发的表情包
+             （读屏把它判成"别人发的"，见 imgutil 的模块说明），于是它读了自拍。
+        新逻辑：按距离一圈圈往外找（±span），候选分三档，**先要好档**：
+          ① 点名那位发的（``want_sender``，用户说「读一下张三的图片」时）
+          ② 别人的图（非 self）
+          ③ 自己的图（``allow_self`` 才放行，最后兜底）
+        机器人自己刚发的图（``_is_my_image``）**直接跳过** —— 用户要看的是群里的
+        图，不是它自己的表情包。
 
         ``allow_self=True`` 给"主人自己喊昵称"那条路用 —— 机器人和主人共用一个
         微信号，主人发的图也是 is_self，不放行就永远认不到他自己发的图。
@@ -2802,7 +3022,13 @@ class Bot:
         i = next((k for k, m in enumerate(msgs) if m is anchor), None)
         if i is None:
             return None
-        for d in (1, -1, 2, -2):          # 先往后看（先说后发图），再往前看
+        want = normalize(want_sender or "")
+        named, others, own = [], [], []
+        order = []
+        for d in range(1, int(span) + 1):     # 先往后看（先说后发图），再往前看
+            order.append(d)
+            order.append(-d)
+        for d in order:
             j = i + d
             if not (0 <= j < len(msgs)):
                 continue
@@ -2811,10 +3037,374 @@ class Bot:
                 continue
             if not getattr(m, "img_path", ""):
                 continue                   # 桥接没取到图（太小 / 取图失败）
-            if m.is_self and not allow_self:
-                continue                   # 群友的图才是"别人让它看的"
-            return m
+            if self._is_my_image(m):
+                continue                   # 机器人自己发的表情包，不当目标
+            who = normalize(getattr(m, "sender", "") or "")
+            if not who and not m.is_self and (self._recently_sent_image()
+                                              or self._looks_like_stock_image(m)):
+                # ★ 没昵称 + 机器人五分钟内发过图 —— 这种"无名图"多半就是它自己
+                #   发的（自己的消息不显示昵称，读屏还可能把它判成"别人发的"）。
+                #   宁可这一条不读（交给翻屏 / 普通回复），也别对着自拍点评。
+                continue
+            if want and self._sender_matches(want, who):
+                named.append(m)
+            elif not m.is_self:
+                others.append(m)
+            elif allow_self:
+                own.append(m)
+        for bucket in (named, others, own):
+            if bucket:
+                return bucket[0]
         return None
+
+    @staticmethod
+    def _name_variants(name) -> list:
+        """昵称的几种可能写法：**原样** + **主名**（第一个括号/分隔符之前的部分）。
+
+        ★ 2026-10-15（用户问「张三（今晚打本）能识别了吗」）：实测屏上读到
+          完整昵称「张三（今晚打本）」、用户只说「张三」时，老逻辑是拿**整个
+          昵称**去撞正文 —— 撞不上，这条点名就被当成"没点名"。微信昵称带后缀
+          （帮派 / 状态 / 颜文字）是常态，所以把"主名"也拿来一起匹配。
+        ⚠️ 只切"第一个分隔符之前"，**不**做更激进的猜测（后缀里也可能有真名）。
+        """
+        s = (name or "").strip()
+        if not s:
+            return []
+        out = [s]
+        head = re.split(r"[（(【\[<「『|｜·,，、\s]", s)[0].strip()
+        if len(head) >= 2 and head != s:
+            out.append(head)
+        return out
+
+    def _sender_matches(self, want: str, who: str) -> bool:
+        """用户说的名字（want）和屏上读到的昵称（who）是不是同一个人。
+
+        ⚠️ 判据**故意比 `state.names_same` 严**：那个是判重用的（共同一个字就算同一个
+          人），拿来做点名匹配太宽 —— 「张三」会匹到「张语」，用户就会看到它去读错人
+          的图。这里只认：任一变体 **相等 / 互为子串**。
+        """
+        if not want or not who:
+            return False
+        for a in self._name_variants(want):
+            for b in self._name_variants(who):
+                if a and b and (a == b or a in b or b in a):
+                    return True
+        return False
+
+    def _is_followed(self, who) -> bool:
+        """屏幕上的这个昵称在不在「特别关注」名单里（2026-10-16）。
+
+        面板填的是昵称（机器人读屏只拿得到昵称，拿不到 wxid），匹配口径
+        复用 :meth:`_sender_matches` —— 只认变体相等 / 互为子串，
+        所以填「张三」能匹到屏上的「张三（今晚打本）」。
+
+        名单文件坏了 / 还没加载过一律当「没关注」，绝不让它把主循环搞挂。
+        """
+        f = getattr(self, "_follow", None) or {}
+        if not f.get("enabled", True):
+            return False
+        who = str(who or "").strip()
+        if not who:
+            return False
+        for one in f.get("ids") or []:
+            try:
+                if self._sender_matches(str(one), who):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _image_target_sender(self, text, snap) -> str:
+        """这句话里点名了谁？（「读一下张三的图片」→「张三」）
+
+        做法是**拿屏幕上出现过的昵称去撞正文**，而不是自己解析「XX 的图片」句式：
+        昵称里本来就可能带「的」、带空格、带后缀（「张三」），正则切出来的是
+        名字还是残句根本说不准；而「这个名字真的在屏上出现过」是硬事实。
+        长名字优先，免得短名把长名截走。
+        """
+        t = normalize(text or "")
+        if not t:
+            return ""
+        names = []
+        for m in (getattr(snap, "messages", None) or []):
+            s = normalize(getattr(m, "sender", "") or "").strip()
+            if len(s) >= 2 and s not in names:
+                names.append(s)
+        for s in sorted(names, key=len, reverse=True):
+            # ★ 2026-10-15：昵称带后缀时用户往往只说主名（「张三」）→ 变体一起撞
+            for v in self._name_variants(s):
+                if len(v) >= 2 and v in t:
+                    return s
+        return ""
+
+    def _maybe_zoom(self, img):
+        """把"屏幕上那张图"点开放大成一张更清楚的图（失败就原样返回）。
+
+        ★ 2026-10-15（用户实测确认后才加）：聊天页里那张缩略图上的小字，OCR 出来是
+          乱码（实测「而明的汗(燃贸穴就口*不填它就田坝」）；而**点开进图片查看器后
+          大图清清楚楚** —— 同一次实测直接读出了「邵千惠故事馆 / 老公正和我闺蜜在
+          卖力地打扑克…」整段。所以被叫看图时，先点开放大、截一张、马上退回。
+
+        ⚠️ 只在**被叫**的两条路上调用；而且失败一律退回原裁剪图 —— 这条路会动界面
+          （点开 → 退出），不能让"随口一句 + 旁边有图"就触发。
+        """
+        z = getattr(self.sender, "zoom_image", None)
+        if not callable(z):
+            return img
+        try:
+            got = z(img_hash=str(getattr(img, "img_hash", "") or ""))
+        except Exception as exc:
+            self.log.warning("点图放大异常：%s: %s" % (type(exc).__name__, exc))
+            return img
+        if not got or not got.get("ok"):
+            err = str((got or {}).get("error")
+                      or getattr(self.sender, "last_zoom_error", "") or "点不开")
+            self.log.info("点图放大没成（%s），改用裁剪图" % err)
+            return img
+        path = str(got.get("path") or "")
+        if not path or not os.path.isfile(path):
+            return img
+        self.log.info("点图放大成功：%s（%dx%d）"
+                      % (os.path.basename(path), int(got.get("w") or 0),
+                         int(got.get("h") or 0)))
+        return Message(blocks=[],
+                       is_self=bool(getattr(img, "is_self", False)),
+                       sender=str(getattr(img, "sender", "") or ""),
+                       kind="image", img_path=path,
+                       img_w=int(got.get("w") or 0),
+                       img_h=int(got.get("h") or 0))
+
+    def _looks_like_ocr_garbage(self, text, snap=None, msg=None) -> bool:
+        """这条是不是"读屏读出来的垃圾"（不该拿它接话）？
+
+        ★ 2026-10-15（用户实测报障）：聊天页里缩略图上的小字被 OCR 成
+          「而明的汗(燃贸穴就口*不填它就田坝」，这种串会像正常消息一样进上下文，
+          模型可能拿它胡答。
+
+        判据**故意很窄**（宁可漏判，也不能把正常话吞了）—— 两条任一命中：
+          ① 紧挨着一条图片消息、而它自己**没有昵称**（群里自己的消息才不显示昵称；
+             别人的消息都有）→ 多半是那张图上的字被读出来了；
+          ② 含 ``*`` 且汉字占比 < 70%（OCR 对星号/杂点的典型产物）。
+        """
+        t = normalize(text or "")
+        if len(t) < 8:
+            return False
+        if snap is not None and msg is not None:
+            msgs = list(getattr(snap, "messages", None) or [])
+            i = next((k for k, m in enumerate(msgs) if m is msg), None)
+            if i is not None and not (getattr(msg, "sender", "") or "").strip():
+                for j in (i - 1, i + 1):
+                    if 0 <= j < len(msgs) and getattr(msgs[j], "kind", "") == "image":
+                        return True
+        if "*" in t or "＊" in t:
+            han = sum(1 for c in t if "\u4e00" <= c <= "\u9fff")
+            if han / float(len(t)) < 0.70:
+                return True
+        return False
+
+    def _scroll_back_for_image(self, snap, want_sender: str = "",
+                               screens: int = 2):
+        """当前屏找不到图 → 往上翻 N 屏找（只在被叫看图时翻）。
+
+        ★ 2026-10-15（用户：「我要的是读张三的消息，**需要翻屏幕**」）：
+          图片消息一旦被刷上去，读屏那一路就再也看不到它 —— ``_nearby_image``
+          只在本屏找。这里借桥接的 ``/backfill``（往上翻 N 屏，**翻完一定切回最新**）
+          把每屏的图片也裁出来，逐屏找；点名的那位发的优先，找不到就退而取
+          屏幕上的"别人的图"。
+        代价：约 10 秒/屏（OCR + 滑块等待），所以**只在被叫看图且本屏没有时**才走。
+        返回 Message 或 None。
+        """
+        bf = getattr(self.sender, "backfill", None)
+        if not callable(bf):
+            self.log.info("当前发送端不支持翻屏找图（不是手机端？）")
+            return None
+        group = str(getattr(self.cfg.target, "group", "") or "")
+        self.log.info("你叫它看图，本屏没有 → 往回翻 %d 屏找图（约 10 秒/屏）" % screens)
+        self._hud_note("机器人在往回翻找图",
+                       "本屏没有，往上翻 %d 屏找那张图" % screens)
+        try:
+            got = bf(screens, group, images=True)
+        except Exception as exc:
+            self.log.warning("翻屏找图异常：%s: %s" % (type(exc).__name__, exc))
+            return None
+        if not got:
+            err = str(getattr(self.sender, "last_backfill_error", "") or "翻不动")
+            self.log.info("翻屏找图失败：%s" % err)
+            return None
+        want = normalize(want_sender or "")
+        fallback = None
+        for fr in (got.get("frames") or []):
+            for m in fr:
+                if m.get("type") != "image" or m.get("is_self"):
+                    continue
+                pth = str(m.get("img_path") or "")
+                if not pth or not os.path.isfile(pth):
+                    continue
+                cand = Message(
+                    blocks=[], is_self=False,
+                    sender=str(m.get("sender") or ""), kind="image",
+                    img_path=pth,
+                    img_w=int(m.get("img_w") or 0),
+                    img_h=int(m.get("img_h") or 0),
+                    img_md5=str(m.get("img_md5") or ""),
+                    img_hash=str(m.get("img_hash") or ""))
+                if self._is_my_image(cand):
+                    continue           # 翻回来的还是机器人自己的图，不算（同 _nearby_image）
+                if not normalize(cand.sender or "") and self._looks_like_stock_image(cand):
+                    continue           # 无名 + 表情包库里有 → 多半是它自己发的
+                who = normalize(cand.sender)
+                if want and self._sender_matches(want, who):
+                    self.log.info("翻屏找到了「%s」发的图：%s"
+                                  % (want, os.path.basename(pth)))
+                    return cand
+                if fallback is None:
+                    fallback = cand
+        if fallback is not None:
+            self.log.info("翻屏找到了图（没对上名字「%s」）：%s"
+                          % (want, os.path.basename(fallback.img_path)))
+        else:
+            self.log.info("翻屏 %d 屏也没找到图片消息" % screens)
+        return fallback
+
+    # ---- 机器人自己发出去的图（指纹记账，见 imgutil 的模块说明）----
+    _MY_IMG_KEEP = 30          # 记最近 30 张（够覆盖一次群里往上翻屏）
+    _MY_IMG_TTL = 3600.0       # 一小时前的记录不再用来判定（屏幕早滚过去了）
+
+    MY_IMAGES_FILE = "my_images.json"     # 落在数据目录（ROOT）里，跨重启
+
+    def _load_my_images(self) -> list:
+        """启动时读回上次记下的"我发过的图"指纹（过了 TTL 的丢掉，见 _remember_my_image）。"""
+        out = []
+        try:
+            p = Path(ROOT) / self.MY_IMAGES_FILE
+            if not p.is_file():
+                return []
+            now = time.time()
+            for it in (json.loads(p.read_text(encoding="utf-8")) or []):
+                t = float((it or {}).get("t") or 0)
+                h = imgutil.hash_from_hex((it or {}).get("h") or "")
+                if h >= 0 and now - t <= self._MY_IMG_TTL:
+                    out.append((t, h))
+        except Exception:
+            return []          # 读不出来就当没有（绝不能因为它把机器人拖挂）
+        return out[-self._MY_IMG_KEEP:]
+
+    def _save_my_images(self) -> None:
+        """把"我发过的图"指纹写盘（失败只记一条 debug —— 这不是关键路径）。"""
+        try:
+            p = Path(ROOT) / self.MY_IMAGES_FILE
+            data = [{"t": round(t, 1), "h": "%016x" % h} for t, h in self._my_images]
+            p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            try:
+                self.log.debug("写 my_images.json 失败（忽略）：%r" % (exc,))
+            except Exception:
+                pass
+
+    def _stock_hashes(self) -> list:
+        """表情包库全部图片的 aHash（懒加载一次，之后走缓存）。
+
+        ★ 2026-10-15：`_my_images` 只覆盖"这次运行（或落盘里）**发出去**的图" ——
+          重启前发的、以及这段代码上线前发的，都不在里面，而屏幕上那条消息还在
+          （用户恰恰会指着它问）。所以再拿**整个表情包库**兜一道：库里的图 =
+          机器人会发的图。161 张算一次约一两秒，只做一次。
+        """
+        if self._stock_hashes_cache is not None:
+            return self._stock_hashes_cache
+        out = []
+        try:
+            root = Path(getattr(getattr(self, "stickers", None), "root", "") or "")
+            if root.is_dir():
+                for p in root.rglob("*"):
+                    if p.suffix.lower() not in (".png", ".jpg", ".jpeg",
+                                                ".gif", ".webp", ".bmp"):
+                        continue
+                    h = imgutil.ahash_int(str(p))
+                    if h >= 0:
+                        out.append(h)
+            self.log.info("表情包库指纹已备好：%d 张（认'屏幕这张是不是我发的'）"
+                          % len(out))
+        except Exception as exc:
+            try:
+                self.log.warning("备表情包库指纹失败（忽略）：%r" % (exc,))
+            except Exception:
+                pass
+            out = []
+        self._stock_hashes_cache = out
+        return out
+
+    def _looks_like_stock_image(self, m) -> bool:
+        """这张图是不是**表情包库里的**（= 机器人可能发出去的）？
+
+        ⚠️ 只在"这张图**没有昵称**"时由调用方使用（见 `_nearby_image`）——
+          有昵称的图是群友发的，哪怕内容恰好跟库里某张一样，那也是群友发的，
+          不该一棍子打死。
+        """
+        try:
+            h = imgutil.hash_from_hex(getattr(m, "img_hash", "") or "")
+            if h < 0:
+                h = imgutil.ahash_int(getattr(m, "img_path", "") or "")
+        except Exception:
+            h = -1
+        if h < 0:
+            return False
+        for sh in self._stock_hashes():
+            if imgutil.same_image(h, sh):
+                return True
+        return False
+
+    def _recently_sent_image(self, window: float = 300.0) -> bool:
+        """机器人最近 window 秒内发过图吗？（用来判断"屏幕上那张没昵称的图"）
+
+        ★ 自己的消息在群聊里**不显示昵称**（读屏给 sender=""），所以"没昵称 +
+          非自己 + 机器人刚发过图"这三条凑齐时，那张图多半就是它自己发的 ——
+          这种时候宁可这条不读，也别对着自拍点评。
+        """
+        if not self._my_images:
+            return False
+        return (time.time() - max(t for t, _ in self._my_images)) <= window
+
+    def _remember_my_image(self, path) -> None:
+        """机器人刚发出一张图 —— 记下它的指纹。
+
+        ⚠️ 记的是**原图文件**的 aHash；读屏裁下来的那张带着聊天背景和头像，
+        实测同一张图两者距离 12 以内（见 imgutil 里的实测数据），所以比得上。
+        """
+        try:
+            h = imgutil.ahash_int(path)
+        except Exception:
+            h = -1
+        if h < 0:
+            return
+        self._my_images.append((time.time(), h))
+        if len(self._my_images) > self._MY_IMG_KEEP:
+            del self._my_images[:-self._MY_IMG_KEEP]
+        self._save_my_images()          # 落盘，重启后还认得出（见 _load_my_images）
+
+    def _is_my_image(self, m) -> bool:
+        """屏幕上这张图，是不是机器人自己刚发出去的那张？
+
+        ★ 为什么不能只看 ``is_self`` / ``_img_self_sent_at``：读屏**偶尔会把自己
+          发的图片气泡判成"别人发的"**（图片气泡挨着文字气泡时就会串行），而用户
+          点名要看的那张，很可能就在机器人几分钟前发的表情包旁边 —— 时间戳兜不住。
+          所以认指纹：桥接已经算好 ``img_hash``（aHash），直接比；老桥接没这个字段
+          时才退回现算裁剪图。
+        """
+        try:
+            h = imgutil.hash_from_hex(getattr(m, "img_hash", "") or "")
+            if h < 0:
+                h = imgutil.ahash_int(getattr(m, "img_path", "") or "")
+        except Exception:
+            h = -1
+        if h < 0:
+            return False
+        now = time.time()
+        for t, mine in self._my_images:
+            if now - t > self._MY_IMG_TTL:
+                continue
+            if imgutil.same_image(h, mine):
+                return True
+        return False
 
     def _collect_image_candidates(self, snap) -> list:
         """挑出这一轮"还没处理过"的图片消息（**只挑别人发的**）。
@@ -3107,6 +3697,11 @@ class Bot:
         self.log.info(f"  模型：{self.cfg.llm.model if self.brain.available else '未配置 API Key（只跑关键词）'}")
         self.log.info(f"  演练模式：{'开' if self.dry_run else '关'}")
         self.log.info(f"  关键词规则：{len(self.matcher.rules)} 条")
+        _fl = getattr(self, "_follow", None) or {}
+        if _fl.get("ids"):
+            self.log.info("  ⭐ 特别关注（说话即回）：%s%s"
+                          % (follow_mod.describe(_fl),
+                             "" if _fl.get("enabled", True) else "（开关：关）"))
         if self.stickers_enabled:
             n_img = sum(1 for r in self.matcher.rules if r.is_image)
             self.log.info(f"  发表情包的规则：{n_img} 条")
